@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+data/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.run.lock
+*.dpapi
+*.jsonl
+/references/archives/
+/releases/
+/tests/fixtures/source_captures/
