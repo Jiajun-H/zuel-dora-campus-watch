@@ -92,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--interval-seconds", type=int, default=60, help="watch间隔，至少60秒，不补跑或重叠")
     parser.add_argument("--daily-get-limit", type=int, default=4320, help="watch每天GET总预算，包含失败与初始参数")
     parser.add_argument("--fetch-fresh-key", action="store_true", help="watch启动缺少参数时仅获取一次分类14参数；失败暂停")
+    parser.add_argument("--freshness-config", type=Path,
+                        help="显式freshKey策略JSON；不传或mode=process保持进程级固定参数")
     parser.add_argument("--watch-state", type=Path, help="安全状态JSON，默认data/reward_watch.status.json")
     parser.add_argument("--watch-stop", type=Path, help="停止标记，默认data/reward_watch.stop.json")
     parser.add_argument("--send-bark", action="store_true", help="显式发送待推送；否则仅持久化")
@@ -114,6 +116,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--body-wait-seconds", type=int, default=120,
                         help="wait等待1..3600秒，到期在下次手动检查/notify兜底")
     args = parser.parse_args(argv)
+    if args.freshness_config is not None and args.command != "watch":
+        emit({"status": "configuration_error", "message": "freshness-config仅适用于watch。"})
+        return 2
     if args.db is None:
         args.db = DEFAULT_DB if args.category == 14 else DEFAULT_DB.parent / "campus_watch_v2.sqlite3"
     if args.command == "watch":
@@ -125,6 +130,10 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         try:
             from .watch import WatchRunner
+            from .freshness_config import load_refresh_policy
+            refresh_policy = load_refresh_policy(args.freshness_config,
+                daily_get_limit=args.daily_get_limit, poll_seconds=args.interval_seconds,
+                max_list_pages=args.max_pages)
             # Validate secret and cipher before opening writable monitoring state.
             notifier = RewardBarkNotifier.from_env(timeout_seconds=args.timeout)
             cipher = CipherParameters.from_file(args.body_cipher_config or DEFAULT_DB.parent / "body_cipher.local.json")
@@ -146,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
                     baseline_pages=args.baseline_pages, coverage_pages=args.coverage_pages or args.baseline_pages,
                     max_pages=args.max_pages, max_alerts=args.max_alerts,
                     fresh_key=fresh, fetch_fresh=args.fetch_fresh_key, timeout=args.timeout,
-                    deep_candidate_ttl_seconds=args.deep_candidate_ttl_seconds)
+                    deep_candidate_ttl_seconds=args.deep_candidate_ttl_seconds,
+                    refresh_policy=refresh_policy)
                 outcome = runner.run()
                 emit({"status": outcome, "message": "watch已结束；只读状态JSON确认原因。"})
                 return {"stopped": 0, "busy": 5, "paused": 3}.get(outcome, 1)

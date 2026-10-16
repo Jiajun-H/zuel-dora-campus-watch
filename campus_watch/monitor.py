@@ -68,6 +68,7 @@ class PollSummary:
     deep_candidate_events: list[dict] = field(default_factory=list)
     page_observations: list[dict] = field(default_factory=list)
     latency_events: list[dict] = field(default_factory=list)
+    freshness: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -517,6 +518,9 @@ class Monitor:
         diagnostic = {"page_number": result.pages, "cursor": cursor,
                       "started_at": started_at, "main_window": result.pages <= self._diagnostic_window_pages,
                       "posts": [], "ordinary_order": [], "truncated": False}
+        key = getattr(self.adapter, "diagnostic_fresh_key", None)
+        if type(key) is int and 0 < key < 2**63:
+            diagnostic["request_fresh_key"] = key
         try:
             page = self.adapter.fetch_page(cursor)
             if self.visibility_mode:

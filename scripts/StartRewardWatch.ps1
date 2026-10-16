@@ -1,4 +1,4 @@
-﻿param([switch]$ChangeBarkKey)
+﻿param([switch]$ChangeBarkKey, [string]$FreshnessConfig)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $projectRoot
@@ -15,6 +15,11 @@ try {
     if ($currentState.guardian_alive) {
         @{ status = 'not_launched'; error_type = 'SupervisorStillFinishing' } | ConvertTo-Json -Compress
         return
+    }
+    $launcherArgs = @()
+    if ($FreshnessConfig) {
+        $resolvedFreshnessConfig = (Resolve-Path -LiteralPath $FreshnessConfig -ErrorAction Stop).ProviderPath
+        $launcherArgs = @('--freshness-config', $resolvedFreshnessConfig)
     }
     $uvCommand = Get-Command uv -CommandType Application -ErrorAction SilentlyContinue
     $uvPath = if ($uvCommand) { $uvCommand.Source } else { Join-Path $env:USERPROFILE '.local\bin\uv.exe' }
@@ -51,10 +56,10 @@ try {
     $OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     if (Test-Path -LiteralPath $uvPath) {
         $launcherOutput = (@{ bark = $barkValue; fresh = $env:DORA_FRESH_KEY_14 } | ConvertTo-Json -Compress |
-            & $uvPath run --locked python -X utf8 .\scripts\launch_watch.py | Out-String)
+            & $uvPath run --locked python -X utf8 .\scripts\launch_watch.py @launcherArgs | Out-String)
     } else {
         $launcherOutput = (@{ bark = $barkValue; fresh = $env:DORA_FRESH_KEY_14 } | ConvertTo-Json -Compress |
-            & $pythonPath -X utf8 .\scripts\launch_watch.py | Out-String)
+            & $pythonPath -X utf8 .\scripts\launch_watch.py @launcherArgs | Out-String)
     }
     if ($LASTEXITCODE -ne 0) {
         @{ status = 'not_launched'; error_type = 'LauncherFailed' } | ConvertTo-Json -Compress

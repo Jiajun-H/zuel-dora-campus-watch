@@ -1,4 +1,4 @@
-"""Independent child-exit alarms; never read or change the post database."""
+"""Independent local health and exit alarms; never touch the post database."""
 
 from __future__ import annotations
 
@@ -21,6 +21,11 @@ from .runtime_evidence import read_runtime_events, record_runtime_event
 SCHEMA = "campus-watch-supervisor-v1"
 MAX_ATTEMPTS = 3
 RETRY_DELAYS = (10, 30, 60)
+RECOVERY_DELAYS = (10, 30, 60, 120, 300)
+POLL_STALE_SECONDS = 180
+CACHE_STALE_SECONDS = 600
+CACHE_STALE_ROUNDS = 3
+HEALTH_REASONS = frozenset({"polling_stalled", "cache_stale", "get_budget_invalid"})
 REASONS = {
     "monitor_paused": "监控因保护性检查失败而暂停",
     "monitor_failed": "监控报告运行失败",
@@ -28,6 +33,9 @@ REASONS = {
     "unexpected_clean_exit": "监控进程退出，但没有主动停止证据",
     "child_launch_failed": "监控子进程未能启动",
     "supervisor_failed": "退出提醒守护发生异常，监控是否仍在运行需要核查",
+    "polling_stalled": "监控轮询状态超过三分钟没有按计划推进",
+    "cache_stale": "连续三轮有效首页响应的缓存 Age 均达到十分钟",
+    "get_budget_invalid": "监控记录的当日 GET 数超过每日硬上限",
 }
 ERROR_TYPES = frozenset({"OSError", "PermissionError", "TimeoutError", "ValueError",
                        "PushDeliveryError", "HttpRequestError", "OperationalError", "RuntimeError"})
@@ -170,6 +178,11 @@ class AlarmOutbox:
                 id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, attempted_at REAL NOT NULL
             );
         """)
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(guard_alarm_outbox)")}
+        for column in ("last_error_reason TEXT", "http_status INTEGER", "bark_code INTEGER"):
+            if column.split()[0] not in columns:
+                self.connection.execute("ALTER TABLE guard_alarm_outbox ADD COLUMN " + column)
+        self.connection.commit()
         self.clock, self.sleeper = clock, sleeper
 
     def close(self):
@@ -181,7 +194,10 @@ class AlarmOutbox:
                 or type(exit_code) is not int or not -(2**31) <= exit_code < 2**32
                 or reason_code not in REASONS):
             raise ValueError("invalid safe exit alarm metadata")
-        identifier = hashlib.sha256(f"58:14:{child_pid}:{child_started_at:.9f}".encode("ascii")).hexdigest()
+        # Preserve exit IDs, while live health alerts cannot consume the later
+        # exit event for this same child. One health reason is sent only once.
+        namespace = f"health:{reason_code}:" if reason_code in HEALTH_REASONS else ""
+        identifier = hashlib.sha256(f"58:14:{namespace}{child_pid}:{child_started_at:.9f}".encode("ascii")).hexdigest()
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO guard_alarm_outbox(event_id,created_at,child_pid,child_started_at,"
@@ -199,16 +215,18 @@ class AlarmOutbox:
     def request_count(self):
         return self.connection.execute("SELECT COUNT(*) FROM guard_alarm_requests").fetchone()[0]
 
-    def deliver(self, event_id, sender, *, progress=lambda event: None):
+    def deliver(self, event_id, sender, *, progress=lambda event: None, max_attempts=MAX_ATTEMPTS):
+        if type(max_attempts) is not int or not 1 <= max_attempts <= MAX_ATTEMPTS:
+            raise ValueError("invalid bounded alarm attempts")
         with _guard_lock(self.path.with_suffix(".delivery.lock")):
-            return self._deliver(event_id, sender, progress=progress)
+            return self._deliver(event_id, sender, progress=progress, max_attempts=max_attempts)
 
-    def _deliver(self, event_id, sender, *, progress):
+    def _deliver(self, event_id, sender, *, progress, max_attempts):
         while True:
             event = self.event(event_id)
             if event["state"] == "sent":
                 return event
-            if event["attempts"] >= MAX_ATTEMPTS:
+            if event["attempts"] >= max_attempts:
                 if event["state"] != "exhausted":
                     with self.connection:
                         self.connection.execute("UPDATE guard_alarm_outbox SET state='exhausted',"
@@ -218,33 +236,62 @@ class AlarmOutbox:
             while delay > 0:
                 self.sleeper(min(1, delay))
                 delay = max(0, event["next_attempt_at"] - self.clock())
-            with self.connection:
-                changed = self.connection.execute(
-                    "UPDATE guard_alarm_outbox SET state='sending',attempts=attempts+1,attempt_started_at=?,"
-                    "next_attempt_at=? WHERE event_id=? AND state<>'sent' AND attempts=? AND attempts<?",
-                    (self.clock(), self.clock() + RETRY_DELAYS[event["attempts"]], event_id, event["attempts"], MAX_ATTEMPTS))
-                if not changed.rowcount:
-                    continue
-                self.connection.execute("INSERT INTO guard_alarm_requests(event_id,attempted_at) VALUES(?,?)",
-                                        (event_id, self.clock()))
+            self._attempt(event, sender, progress=progress, max_attempts=max_attempts)
+
+    def retry_once(self, event_id, sender, *, progress=lambda event: None):
+        """Retry one exit event; the global delivery lock never covers backoff."""
+        with _guard_lock(self.path.with_suffix(".delivery.lock")):
             event = self.event(event_id)
-            self._progress(progress, event)
-            try:
-                sender.send(event)
-            except Exception as failure:
-                error_type = type(failure).__name__
-                error_type = error_type if error_type in ERROR_TYPES else "UnexpectedError"
+            if event["reason_code"] in HEALTH_REASONS:
+                raise ValueError("live health warnings do not use exit recovery")
+            if event["state"] == "sent":
+                return event
+            if event["state"] == "exhausted":
                 with self.connection:
-                    self.connection.execute(
-                        "UPDATE guard_alarm_outbox SET state=?,last_error=?,next_attempt_at=? WHERE event_id=? AND state='sending'",
-                        ("exhausted" if event["attempts"] >= MAX_ATTEMPTS else "pending", error_type,
-                         self.clock() + RETRY_DELAYS[event["attempts"] - 1], event_id))
-            else:
-                with self.connection:
-                    self.connection.execute(
-                        "UPDATE guard_alarm_outbox SET state='sent',notified_at=?,last_error=NULL WHERE event_id=?",
-                        (self.clock(), event_id))
-            self._progress(progress, self.event(event_id))
+                    self.connection.execute("UPDATE guard_alarm_outbox SET state='pending' WHERE event_id=?", (event_id,))
+                event = self.event(event_id)
+            if event["next_attempt_at"] <= self.clock():
+                self._attempt(event, sender, progress=progress, recovery=True)
+            return self.event(event_id)
+
+    def _attempt(self, event, sender, *, progress, recovery=False, max_attempts=MAX_ATTEMPTS):
+        event_id = event["event_id"]
+        delay = RECOVERY_DELAYS[min(event["attempts"], len(RECOVERY_DELAYS) - 1)]
+        with self.connection:
+            changed = self.connection.execute(
+                "UPDATE guard_alarm_outbox SET state='sending',attempts=attempts+1,attempt_started_at=?,"
+                "next_attempt_at=? WHERE event_id=? AND state<>'sent' AND attempts=?",
+                (self.clock(), self.clock() + delay, event_id, event["attempts"]))
+            if not changed.rowcount:
+                return
+            self.connection.execute("INSERT INTO guard_alarm_requests(event_id,attempted_at) VALUES(?,?)",
+                                    (event_id, self.clock()))
+        event = self.event(event_id)
+        self._progress(progress, event)
+        try:
+            sender.send({**event, "delayed": True} if recovery else event)
+        except Exception as failure:
+            error_type = type(failure).__name__
+            error_type = error_type if error_type in ERROR_TYPES else "UnexpectedError"
+            reason = getattr(failure, "reason_code", None)
+            if type(reason) is not str or reason not in {"delivery_failed", "transport_failure", "http_rejected", "invalid_response", "bark_rejected"}:
+                reason = "delivery_failed"
+            http_status, bark_code = getattr(failure, "http_status", None), getattr(failure, "bark_code", None)
+            http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+            bark_code = bark_code if type(bark_code) is int and 0 <= bark_code <= 999 else None
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE guard_alarm_outbox SET state=?,last_error=?,last_error_reason=?,http_status=?,bark_code=?,"
+                    "next_attempt_at=? WHERE event_id=? AND state='sending'",
+                    ("exhausted" if not recovery and event["attempts"] >= max_attempts else "pending", error_type,
+                     reason, http_status, bark_code, self.clock() + delay, event_id))
+        else:
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE guard_alarm_outbox SET state='sent',notified_at=?,last_error=NULL,last_error_reason=NULL,"
+                    "http_status=NULL,bark_code=NULL WHERE event_id=?",
+                    (self.clock(), event_id))
+        self._progress(progress, self.event(event_id))
 
     @staticmethod
     def _progress(callback, event):
@@ -265,12 +312,18 @@ class AlarmSender:
         payload = {
             "device_key": self.notifier.device_key, "title": "【监控已停止】中南大悬赏",
             "body": f"{reason}。\n检测时间：{stamp}\n退出代码：{event['exit_code']}\n当前没有自动检查；请打开查看监控状态。",
-            "group": "campus-watch-health", "id": "campus-watch-health-" + event["event_id"],
+            # Bark forwards id to APNs CollapseID, which is limited to 64 bytes.
+            "group": "campus-watch-health", "id": event["event_id"],
             "isArchive": "1",
         }
         if event["reason_code"] == "supervisor_failed":
             payload["title"] = "【守护异常】中南大悬赏"
             payload["body"] = f"{reason}。\n检测时间：{stamp}\n请打开查看监控状态；守护未自动重启监控。"
+        elif event["reason_code"] in HEALTH_REASONS:
+            payload["title"] = "【监控异常】中南大悬赏"
+            payload["body"] = f"{reason}。\n检测时间：{stamp}\n检测时监控进程仍在运行，请查看本地日志；守护未重启监控。"
+        if event.get("delayed"):
+            payload["body"] = f"【延迟补发】{reason}。\n异常检测时间：{stamp}\n退出代码：{event['exit_code']}\n此前告警发送失败，现重新通知；请查看当前监控状态。"
         self.notifier._send_payload(payload)
 
 
@@ -306,8 +359,14 @@ class WatchSupervisor:
         self.child = None
         self.child_started_at = self.started_at
         self.owned_state = None
+        self.owned_health_state = None
         self.owned_pids = set()
+        self.health_alerted = set()
+        self.health_alarm_state = "none"
+        self.last_health_round = None
+        self.stale_cache_rounds = 0
         self.alarm_attempts, self.alarm_state, self.alarm_requests = 0, "none", 0
+        self.alarm_event_id = None
         self.state_publish_error = False
 
     def publish(self, state, reason_code, **extra):
@@ -319,6 +378,7 @@ class WatchSupervisor:
                  "watch_started_at": self.owned_state["started_at"] if self.owned_state else None,
                  "alarm_state": self.alarm_state, "alarm_attempts": self.alarm_attempts,
                  "alarm_requests": self.alarm_requests, "state_publish_error": self.state_publish_error,
+                 "health_warnings": sorted(self.health_alerted), "health_alarm_state": self.health_alarm_state,
                  **extra}
         try:
             self.guard_state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -357,6 +417,69 @@ class WatchSupervisor:
                 self.owned_state = {"pid": state["pid"], "started_at": state["started_at"],
                                     "state": state["state"],
                                     "stop_requested": state.get("reason") == "stop_requested"}
+                # This snapshot is consumed locally only. Never publish source
+                # fields or response bodies in guardian output or Bark alerts.
+                self.owned_health_state = state
+
+    def health_reasons(self):
+        """Inspect only an owned child's existing state; no probe requests."""
+        state = self.owned_health_state
+        if not state or state.get("state") not in {"starting", "scanning", "waiting"}:
+            return []
+        reasons, now = [], self.clock()
+        updated = state.get("updated_at")
+        due = state.get("next_check_at")
+        if ((_number(updated) and state["started_at"] <= updated <= now
+                and now - updated > POLL_STALE_SECONDS)
+                or (state["state"] == "waiting" and _number(due)
+                    and state["started_at"] <= due <= now
+                    and now - due > POLL_STALE_SECONDS)):
+            reasons.append("polling_stalled")
+        counts = state.get("requests_today")
+        if (type(counts) is dict and all(type(counts.get(kind)) is int and counts[kind] >= 0
+                                        for kind in ("fresh_get", "list_get"))
+                and counts["fresh_get"] + counts["list_get"] > 4320):
+            reasons.append("get_budget_invalid")
+        round_number = state.get("rounds")
+        if (state["state"] == "waiting" and type(round_number) is int and round_number > 0
+                and (self.last_health_round is None or round_number > self.last_health_round)):
+            if self.last_health_round is not None and round_number != self.last_health_round + 1:
+                self.stale_cache_rounds = 0
+            self.last_health_round = round_number
+            freshness, summary = state.get("freshness"), state.get("last_summary")
+            home = freshness.get("home_response") if type(freshness) is dict else None
+            age = home.get("age") if type(home) is dict else None
+            valid = (_number(updated) and state["started_at"] <= updated <= now
+                     and now - updated <= POLL_STALE_SECONDS
+                     and type(freshness) is dict and freshness.get("mode") == "fixed"
+                     and type(summary) is dict and summary.get("status") in {"baseline", "ok", "partial"}
+                     and summary.get("retry_failures", 0) == 0
+                     and type(age) is int and age >= CACHE_STALE_SECONDS)
+            self.stale_cache_rounds = self.stale_cache_rounds + 1 if valid else 0
+        if self.stale_cache_rounds >= CACHE_STALE_ROUNDS:
+            reasons.append("cache_stale")
+        return reasons
+
+    def check_health(self):
+        """Bounded, once-per-child health notices never affect child lifetime."""
+        for reason in self.health_reasons():
+            if reason in self.health_alerted:
+                continue
+            self.health_alerted.add(reason)
+            try:
+                event_id = self.outbox.create(child_pid=self.owned_state["pid"],
+                    child_started_at=self.owned_state["started_at"], exit_code=0,
+                    reason_code=reason, created_at=self.clock())
+                sender = self.sender or AlarmSender()
+                # A live warning gets one HTTP attempt and no backoff loop;
+                # child-exit alarms retain the existing three-attempt policy.
+                event = self.outbox.deliver(event_id, sender, max_attempts=1)
+                self.health_alarm_state = event["state"]
+            except Exception as failure:
+                self.health_alarm_state = "delivery_failed"
+                record_runtime_event(self.guard_journal, "unhandled_exception", started_at=self.started_at,
+                                     stage="run", error_type=type(failure).__name__)
+            self.alarm_requests = self.outbox.request_count
 
     def exit_time(self, detected_at):
         if self.runtime_path is not None:
@@ -406,6 +529,7 @@ class WatchSupervisor:
                     else:
                         while self.child.poll() is None:
                             self.observe_child_state()
+                            self.check_health()
                             self.publish("watching", "child_running")
                             self.sleeper(self.poll_seconds)
                         exit_code = self.child.returncode
@@ -418,6 +542,7 @@ class WatchSupervisor:
                     started = self.owned_state["started_at"] if self.owned_state else self.child_started_at
                     event_id = self.outbox.create(child_pid=pid, child_started_at=started,
                         exit_code=exit_code, reason_code=reason, created_at=self.clock())
+                    self.alarm_event_id = event_id
                     if self.sender is None:
                         try:
                             self.sender = AlarmSender()
@@ -440,6 +565,7 @@ class WatchSupervisor:
                             start = self.owned_state["started_at"] if self.owned_state else self.child_started_at
                             event_id = self.outbox.create(child_pid=pid, child_started_at=start,
                                 exit_code=3, reason_code="supervisor_failed", created_at=self.clock())
+                            self.alarm_event_id = event_id
                             sender = self.sender or AlarmSender()
                             self.outbox.deliver(event_id, sender, progress=self.alarm_progress)
                         except Exception:
@@ -466,6 +592,7 @@ def main(argv=None):
     parser.add_argument("--runtime")
     parser.add_argument("--bark-server")
     parser.add_argument("--link-hosts")
+    parser.add_argument("--retry-alarm")
     parser.add_argument("--cwd", default=str(Path.cwd()))
     parser.add_argument("child", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -476,10 +603,28 @@ def main(argv=None):
             os.environ["BARK_SERVER"] = _server_base(args.bark_server)
         if args.link_hosts:
             os.environ["BARK_LINK_HOSTS"] = args.link_hosts
-        result = WatchSupervisor(child, cwd=args.cwd, watch_state_path=args.state, stop_path=args.stop,
-            guard_state_path=args.guard_state, alarm_db_path=args.alarm_db, runtime_path=args.runtime).run()
+        from .alarm_recovery import AlarmRecovery, validate_recovery_event
+        if args.retry_alarm:
+            if child:
+                raise ValueError("exit recovery cannot launch a monitor")
+            validate_recovery_event(args.alarm_db, args.guard_state, args.retry_alarm)
+            return AlarmRecovery(args.alarm_db, args.retry_alarm).run()
+        guard = WatchSupervisor(child, cwd=args.cwd, watch_state_path=args.state, stop_path=args.stop,
+            guard_state_path=args.guard_state, alarm_db_path=args.alarm_db, runtime_path=args.runtime)
+        result = guard.run()
+        if guard.alarm_event_id and guard.alarm_state not in {"sent", "configuration_missing", "none"}:
+            # run() has released the monitor-supervisor lock. A new monitor can
+            # start while this process only retries its own durable exit alarm.
+            return AlarmRecovery(args.alarm_db, guard.alarm_event_id, process_started_at=guard.started_at).run()
         return 0 if result in {"manual_stop", "duplicate_instance", "alarm_sent"} else 3
     except Exception as failure:
-        record_runtime_event(Path(args.guard_state).with_suffix(".runtime.jsonl"), "unhandled_exception",
+        journal = Path(args.guard_state).with_suffix(".runtime.jsonl")
+        if args.retry_alarm:
+            from .alarm_recovery import recovery_path
+            try:
+                journal = recovery_path(args.alarm_db, args.retry_alarm).with_suffix(".runtime.jsonl")
+            except ValueError:
+                return 3
+        record_runtime_event(journal, "unhandled_exception",
                              stage="run", error_type=type(failure).__name__, errno=getattr(failure, "errno", None))
         return 3

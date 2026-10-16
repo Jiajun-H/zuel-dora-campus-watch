@@ -17,6 +17,8 @@
 | 提醒内容便于判断 | 优先使用已验证的正文或预览 | 标记正文完整性，无法确认时明确降级 |
 | 避免重复看到旧帖 | 重新启动后仍能识别已观察和已发送内容 | 使用本地 SQLite 保存观察与通知状态 |
 | 后台运行状态可追踪 | 查看运行状态、停止监测并核查异常 | Windows 启停入口与独立进程监督 |
+| 异常退出告警可恢复 | 主监测退出后，告警仍可独立补发并查看重试状态 | 事件校验与独立恢复进程 |
+| 控制刷新开销 | 参数刷新遵守最低间隔和每日上限 | 显式配置并纳入请求预算 |
 
 ## 工作流程
 
@@ -41,6 +43,7 @@ flowchart LR
 | [`body.py`](campus_watch/body.py) | 解析正文并标记完整性 |
 | [`notifier.py`](campus_watch/notifier.py) | 组织 Bark 通知并记录投递状态 |
 | [`watch.py`](campus_watch/watch.py)、[`supervisor.py`](campus_watch/supervisor.py) | 管理轮询预算、后台进程与运行证据 |
+| [reshness.py](campus_watch/freshness.py)、[larm_recovery.py](campus_watch/alarm_recovery.py) | 管理刷新策略，并在异常退出后独立恢复告警 |
 
 ## 快速体验
 

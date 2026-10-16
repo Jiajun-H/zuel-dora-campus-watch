@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import importlib
+import argparse
 import time
 from urllib.parse import urlsplit
 
@@ -37,13 +38,49 @@ def spawn_background(command, *, cwd, env):
     return subprocess.Popen(command, **options)
 
 
-def main():
+def main(argv=None):
     root = Path(__file__).resolve().parents[1]
     try:
         sys.path.insert(0, str(root))
+        parser = argparse.ArgumentParser(description="Launch the existing single-instance Windows watch flow")
+        parser.add_argument("--key-status", action="store_true")
+        parser.add_argument("--probe-fresh", action="store_true")
+        parser.add_argument("--freshness-config", type=Path)
+        parser.add_argument("--retry-alarm")
+        args = parser.parse_args(argv)
+        if args.retry_alarm:
+            from campus_watch.alarm_recovery import validate_recovery_event
+            event = validate_recovery_event(root / "data/reward_watch.alarms.sqlite3",
+                                           root / "data/reward_watch.supervisor.json", args.retry_alarm)
+            if event["state"] == "sent":
+                print(json.dumps({"status": "already_sent"}))
+                return 0
+            command = [sys.executable, "-X", "utf8", str(root / "scripts/watch_supervisor.py"),
+                       "--state", str(root / "data/reward_watch.status.json"),
+                       "--stop", str(root / "data/reward_watch.stop.json"),
+                       "--guard-state", str(root / "data/reward_watch.supervisor.json"),
+                       "--alarm-db", str(root / "data/reward_watch.alarms.sqlite3"),
+                       "--retry-alarm", args.retry_alarm]
+            if os.environ.get("BARK_SERVER"):
+                from campus_watch.notifier import _server_base
+                command.extend(["--bark-server", _server_base(os.environ["BARK_SERVER"].strip())])
+            if os.name == "nt":
+                from campus_watch.windows_launch import spawn_independent
+                process = spawn_independent(command, cwd=root, script=root / "scripts/SpawnIndependentWatch.ps1")
+            else:
+                process = spawn_background(command, cwd=root, env=os.environ.copy())
+            print(json.dumps({"status": "alarm_recovery_launching", "pid": process.pid}))
+            return 0
+        config_path = args.freshness_config.resolve() if args.freshness_config is not None else None
+        from campus_watch.freshness_config import load_refresh_policy
+        refresh_policy = load_refresh_policy(config_path, daily_get_limit=4320, poll_seconds=60, max_list_pages=3)
+        if refresh_policy is not None and args.probe_fresh:
+            # Legacy probe books a startup GET outside the fixed-mode daily
+            # fresh cap. Refuse before reading seed/credentials or any I/O.
+            raise ValueError("Legacy parameter probe cannot be combined with fixed freshness policy.")
         from campus_watch.local_secrets import load_bark_key, save_bark_key, normalize_bark_key
         secret_path = root / "data/bark_key.dpapi"
-        if "--key-status" in sys.argv:
+        if args.key_status:
             candidate = os.environ.get("BARK_KEY", "").strip()
             key = normalize_bark_key(candidate) if candidate else load_bark_key(secret_path)
             print(json.dumps({"status": "key_status", "key_available": bool(key),
@@ -65,7 +102,7 @@ def main():
             save_bark_key(secret_path, key)
         env["BARK_KEY"] = key
         fresh = seed.get("fresh") or env.get("DORA_FRESH_KEY_14", "")
-        if "--probe-fresh" in sys.argv and not fresh:
+        if args.probe_fresh and not fresh:
             # Explicit one-shot contract review. Hold the response only in RAM;
             # print types/predicates, never the token, and reuse it after review.
             sys.path.insert(0, str(root))
@@ -102,6 +139,8 @@ def main():
                    "--daily-get-limit", "4320", "--max-alerts", "20", "--timeout", "10", "--send-bark"]
         if not fresh:
             child_command.append("--fetch-fresh-key")
+        if config_path is not None:
+            child_command.extend(["--freshness-config", str(config_path)])
         command = [sys.executable, "-X", "utf8", str(root / "scripts/watch_supervisor.py"),
                    "--state", str(root / "data/reward_watch.status.json"),
                    "--stop", str(root / "data/reward_watch.stop.json"),

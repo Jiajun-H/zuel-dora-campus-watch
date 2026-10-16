@@ -27,6 +27,23 @@ class Notifier(Protocol):
 class PushDeliveryError(RuntimeError):
     """Safe delivery failure; never contains credentials or the response body."""
 
+    def __init__(
+        self,
+        *args: object,
+        reason_code: str = "delivery_failed",
+        http_status: int | None = None,
+        bark_code: int | None = None,
+    ) -> None:
+        super().__init__(*args)
+        self.reason_code = (
+            reason_code if type(reason_code) is str and reason_code in {
+                "delivery_failed", "transport_failure", "http_rejected",
+                "invalid_response", "bark_rejected",
+            } else "delivery_failed"
+        )
+        self.http_status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        self.bark_code = bark_code if type(bark_code) is int and 0 <= bark_code <= 999 else None
+
 
 class MissingSummary(PushDeliveryError):
     """A required post summary is absent; the caller must keep work pending."""
@@ -159,20 +176,41 @@ class BarkNotifier:
         if self.simulation:
             payload = {**payload, "title": "【模拟】中南大校圈集成验收"}
         failed = False
+        metadata: dict = {}
         try:
             result = get_json(
                 f"{self.server}/push",
                 payload=payload,
                 timeout_seconds=self.timeout_seconds,
+                response_metadata=metadata,
             )
         except (HttpRequestError, OSError):
             failed = True
+        status = metadata.get("http_status")
+        http_status = status if type(status) is int and 100 <= status <= 599 else None
         if failed:
-            raise PushDeliveryError("Bark request failed; notification remains pending")
+            reason = "transport_failure" if http_status is None else (
+                "invalid_response" if 200 <= http_status < 300 else "http_rejected"
+            )
+            raise PushDeliveryError(
+                "Bark request failed; notification remains pending",
+                reason_code=reason, http_status=http_status,
+            )
         if not isinstance(result, dict) or type(result.get("code")) not in (int, str):
-            raise PushDeliveryError("Bark response is invalid; notification remains pending")
+            raise PushDeliveryError(
+                "Bark response is invalid; notification remains pending",
+                reason_code="invalid_response", http_status=http_status,
+            )
         if result["code"] not in (200, "200"):
-            raise PushDeliveryError("Bark rejected the notification; notification remains pending")
+            code = result["code"]
+            if type(code) is str:
+                code = int(code) if re.fullmatch(r"0|[1-9][0-9]{0,2}", code) else None
+            bark_code = code if type(code) is int and 0 <= code <= 999 else None
+            raise PushDeliveryError(
+                "Bark rejected the notification; notification remains pending",
+                reason_code="bark_rejected" if bark_code is not None else "invalid_response",
+                http_status=http_status, bark_code=bark_code,
+            )
 
     def send(self, post: ForumPost) -> None:
         invalid_summary = False

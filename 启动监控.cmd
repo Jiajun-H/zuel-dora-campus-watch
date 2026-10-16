@@ -1,5 +1,5 @@
 @echo off
 setlocal
 chcp 65001 >nul
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\WatchControl.ps1" -Action start
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\WatchControl.ps1" -Action start -FreshnessConfig "%~dp0config\freshness.daily.json"
 pause

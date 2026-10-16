@@ -62,7 +62,8 @@ if (Test-Path -LiteralPath $guardianPath) {
                 $candidate.updated_at -is [int] -or $candidate.updated_at -is [long]) -and
                 $candidate.updated_at -gt 0 -and $candidate.updated_at -lt 253402300799) { $guardian.updated_at=[double]$candidate.updated_at }
             if ($candidate.alarm_state -in 'none','pending','sending','sent','exhausted','configuration_missing','evidence_failed') { $guardian.alarm_state=[string]$candidate.alarm_state }
-            if (($candidate.alarm_attempts -is [int] -or $candidate.alarm_attempts -is [long]) -and $candidate.alarm_attempts -ge 0 -and $candidate.alarm_attempts -le 3) { $guardian.alarm_attempts=[int]$candidate.alarm_attempts }
+            if (($candidate.alarm_attempts -is [int] -or $candidate.alarm_attempts -is [long]) -and $candidate.alarm_attempts -ge 0) { $guardian.alarm_attempts=[long]$candidate.alarm_attempts }
+            if ($candidate.alarm_event_id -cmatch '^[0-9a-f]{64}$') { $guardian.alarm_event_id=[string]$candidate.alarm_event_id }
             if (($candidate.alarm_requests -is [int] -or $candidate.alarm_requests -is [long]) -and $candidate.alarm_requests -ge 0) { $guardian.alarm_requests=[long]$candidate.alarm_requests }
             if ($candidate.reason_code -in 'child_starting','child_running','manual_stop','duplicate_instance','monitor_paused','monitor_failed','unexpected_exit','unexpected_clean_exit','child_launch_failed','outbox_failed','supervisor_failed') { $guardian.reason_code=[string]$candidate.reason_code }
             $guardProcess = Get-Process -Id $guardian.pid -ErrorAction SilentlyContinue
@@ -72,6 +73,44 @@ if (Test-Path -LiteralPath $guardianPath) {
             }
         }
     } catch { $guardian=$null; $guardianAlive=$false }
+}
+$alarmRetries = @()
+$retryRoot = Join-Path $projectRoot 'data/reward_watch.alarms.retries'
+if (Test-Path -LiteralPath $retryRoot) {
+    foreach ($retryFile in @(Get-ChildItem -LiteralPath $retryRoot -Filter '*.json' -File | Sort-Object LastWriteTime -Descending | Select-Object -First 100)) {
+        try {
+            if ($retryFile.Length -gt 8192 -or $retryFile.BaseName -cnotmatch '^[0-9a-f]{64}$') { continue }
+            $retry = (Read-SharedText $retryFile.FullName) | ConvertFrom-Json
+            if ($retry.schema -ne 'campus-watch-alarm-recovery-v1' -or $retry.alarm_event_id -cne $retryFile.BaseName -or
+                $retry.state -notin 'pending','sending','sent','exhausted' -or
+                ($retry.pid -isnot [int] -and $retry.pid -isnot [long]) -or $retry.pid -lt 1 -or $retry.pid -gt 2147483647 -or
+                ($retry.attempts -isnot [int] -and $retry.attempts -isnot [long]) -or $retry.attempts -lt 0 -or
+                $retry.started_at -is [bool] -or -not ($retry.started_at -gt 0 -and $retry.started_at -lt 253402300799)) { continue }
+            $retryAlive = $false
+            $retryProcess = Get-Process -Id ([int]$retry.pid) -ErrorAction SilentlyContinue
+            if ($retryProcess -and $retryProcess.ProcessName -like 'python*') {
+                $retryEpoch = ([DateTimeOffset]$retryProcess.StartTime.ToUniversalTime()).ToUnixTimeSeconds()
+                $retryAlive = [Math]::Abs($retryEpoch - [double]$retry.started_at) -lt 10
+            }
+            $safeRetry = @{ alarm_event_id=[string]$retry.alarm_event_id; pid=[int]$retry.pid; alive=$retryAlive;
+                state=[string]$retry.state; attempts=[long]$retry.attempts }
+            if (($retry.alarm_requests -is [int] -or $retry.alarm_requests -is [long]) -and $retry.alarm_requests -ge 0) { $safeRetry.alarm_requests=[long]$retry.alarm_requests }
+            foreach ($timeField in 'next_attempt_at','notified_at') {
+                if ($retry.$timeField -isnot [bool] -and $retry.$timeField -gt 0 -and $retry.$timeField -lt 253402300799) { $safeRetry[$timeField]=[double]$retry.$timeField }
+            }
+            if ($retry.last_error_reason -in 'delivery_failed','transport_failure','http_rejected','invalid_response','bark_rejected') { $safeRetry.last_error_reason=[string]$retry.last_error_reason }
+            foreach ($codeField in 'http_status','bark_code') {
+                if (($retry.$codeField -is [int] -or $retry.$codeField -is [long]) -and $retry.$codeField -ge 0 -and $retry.$codeField -le 999) { $safeRetry[$codeField]=[int]$retry.$codeField }
+            }
+            $alarmRetries += [pscustomobject]$safeRetry
+            if ($guardian -and $guardian.alarm_event_id -eq $retry.alarm_event_id) {
+                $guardian.alarm_state=[string]$retry.state
+                $guardian.alarm_attempts=[long]$retry.attempts
+                if ($safeRetry.ContainsKey('alarm_requests')) { $guardian.alarm_requests=$safeRetry.alarm_requests }
+                if ($guardian.state -eq 'stopped' -and $guardian.pid -eq $retry.pid -and $retryAlive) { $guardianAlive=$false }
+            }
+        } catch { continue }
+    }
 }
 $guardEvents = @(Read-SafeEvents (Join-Path $projectRoot 'data/reward_watch.supervisor.runtime.jsonl'))
 $recentGuardStart = $guardEvents | Where-Object event -eq 'process_started' | Select-Object -Last 1
@@ -128,7 +167,7 @@ if ($evidenceStart) {
 }
 if (-not $watchState) {
     @{ running=$false; process_alive=$false; windowless=$false; state='not_started'; state_readable=$false;
-       guardian_alive=$guardianAlive; guardian=$guardian; guardian_failure=$guardianFault; guardian_exit=$guardianExit } | ConvertTo-Json -Depth 8
+       guardian_alive=$guardianAlive; guardian=$guardian; guardian_failure=$guardianFault; guardian_exit=$guardianExit; alarm_retries=@($alarmRetries) } | ConvertTo-Json -Depth 8
     return
 }
 $watchProcess = Get-Process -Id ([int]$watchState.pid) -ErrorAction SilentlyContinue
@@ -158,4 +197,4 @@ if (-not $processAlive) {
 @{ running=$running; process_alive=$processAlive; state_readable=[bool]$stateReadable;
    windowless=($processAlive -and $watchProcess.ProcessName -eq 'pythonw'); monitor=$watchState;
    runtime_state=$runtimeState; last_runtime_failure=$lastFault; last_process_exit=$lastExit;
-   guardian_alive=$guardianAlive; guardian=$guardian; guardian_failure=$guardianFault; guardian_exit=$guardianExit } | ConvertTo-Json -Depth 14
+   guardian_alive=$guardianAlive; guardian=$guardian; guardian_failure=$guardianFault; guardian_exit=$guardianExit; alarm_retries=@($alarmRetries) } | ConvertTo-Json -Depth 14

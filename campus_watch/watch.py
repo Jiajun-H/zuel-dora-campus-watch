@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone, timedelta
 import json
 import os
@@ -22,6 +22,15 @@ from .runtime_evidence import record_runtime_event
 
 BEIJING = timezone(timedelta(hours=8))
 FRESH_ENDPOINT = "https://wm.dolacc.com/user/getHomeFreshkey"
+
+
+def numeric_fresh_key(value):
+    """Only the observed non-sensitive numeric form is allowed in diagnostics."""
+    if (type(value) is str and value.isascii() and value.isdecimal()
+            and 0 < len(value) <= 19 and value[0] != "0"):
+        number = int(value)
+        return number if 0 < number < 2**63 else None
+    return None
 
 
 class WatchStopped(SourceProtocolError):
@@ -113,6 +122,23 @@ class RequestLedger:
     def close(self):
         self.con.close()
 
+    def reserve_fresh(self, *, daily_fresh_limit, list_reserve, external_gets=0, total_limit=None):
+        """Atomically count fresh attempts without spending reserved list pages."""
+        total_limit = self.limit if total_limit is None else min(self.limit, total_limit)
+        if (type(daily_fresh_limit) is not int or not 1 <= daily_fresh_limit <= 1440
+                or any(type(v) is not int or v < 0 for v in (list_reserve, external_gets))):
+            raise ValueError("invalid fresh reservation bounds")
+        stamp = int(self.clock())
+        day = datetime.fromtimestamp(stamp, BEIJING).date().isoformat()
+        with self.con:
+            self.con.execute("BEGIN IMMEDIATE")
+            counts = dict(self.con.execute("SELECT kind,COUNT(*) FROM attempts WHERE day=? GROUP BY kind", (day,)))
+            used = counts.get("list_get", 0) + counts.get("fresh_get", 0)
+            if (counts.get("fresh_get", 0) >= daily_fresh_limit
+                    or used + external_gets + list_reserve + 1 > total_limit):
+                raise RequestBudgetExceeded("refresh_would_consume_reserved_pagination")
+            self.con.execute("INSERT INTO attempts(at,day,kind) VALUES(?,?,'fresh_get')", (stamp, day))
+
 
 def fetch_current_fresh_key(ledger: RequestLedger, *, timeout=10, stopped=lambda: False):
     """One explicit initial parameter request; never refresh after failure."""
@@ -161,6 +187,7 @@ class BudgetAdapter:
         self.source_scope = adapter.source_scope
         self.page_limit, self.requests = page_limit, 0
         self.last_response_metadata = {}
+        self.diagnostic_fresh_key = getattr(adapter, "diagnostic_fresh_key", None)
 
     def fetch_page(self, cursor=-1):
         self.last_response_metadata = {}
@@ -201,6 +228,12 @@ class WatchMonitor(Monitor):
     def __init__(self, *args, stopped, **kwargs):
         super().__init__(*args, **kwargs)
         self.stopped = stopped
+        self.freshness_report = None
+
+    def _annotate_page_observations(self, result):
+        super()._annotate_page_observations(result)
+        if self.freshness_report is not None:
+            result.freshness = self.freshness_report(result)
 
     def _deliver_pending(self, result):
         if self.stopped():
@@ -214,7 +247,19 @@ class WatchRunner:
                  stop_path: Path, ledger_path: Path, interval=60, daily_get_limit=4320,
                  baseline_pages=2, coverage_pages=2, max_pages=3, max_alerts=20,
                  fresh_key=None, fetch_fresh=False, timeout=10, clock=time.time,
-                 monotonic=time.monotonic, sleeper=None, deep_candidate_ttl_seconds=900):
+                 monotonic=time.monotonic, sleeper=None, deep_candidate_ttl_seconds=900,
+                 refresh_policy=None):
+        from .freshness import RefreshPolicy
+        self.refresh_policy = refresh_policy or RefreshPolicy()
+        if (not isinstance(self.refresh_policy, RefreshPolicy)
+                or self.refresh_policy.mode not in ("process", "fixed")
+                or (self.refresh_policy.mode == "fixed" and (
+                    self.refresh_policy.min_interval_seconds < 120
+                    or not 1 <= self.refresh_policy.daily_fresh_limit <= 720
+                    or self.refresh_policy.daily_get_limit != daily_get_limit
+                    or self.refresh_policy.poll_seconds != interval
+                    or self.refresh_policy.max_list_pages != max_pages))):
+            raise ValueError("unsupported production refresh configuration")
         if store.discovery_policy != "visibility" or store.target_category != 14:
             raise ValueError("watch only supports isolated reward visibility state")
         if type(interval) is not int or interval < 60:
@@ -257,6 +302,10 @@ class WatchRunner:
         self.last_summary = None
         self.last_state_write_attempts = 0
         self.last_requested_state = "starting"
+        self.key_manager = None
+        self.last_fresh_success_at = None
+        self.freshness_state = {"mode": self.refresh_policy.mode, "refreshed": False,
+                                "reason": "not_started", "current_fresh_key": None}
 
     def stopped(self):
         if self.stop_event.is_set():
@@ -288,9 +337,44 @@ class WatchRunner:
                  "notification_policy": "notify-window", "body_policy": "require",
                  "rounds": self.rounds, "daily_get_limit": self.daily_get_limit,
                  "requests_today": self.ledger.counts() if self.ledger else {},
+                 "freshness": self.current_freshness(),
                  "last_summary": self.last_summary, **extra}
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.last_state_write_attempts = atomic_write_state(self.state_path, value)
+
+    def current_freshness(self):
+        result = dict(self.freshness_state)
+        if self.key_manager is not None and self.key_manager.last_decision is not None:
+            result.update(self.key_manager.last_decision)
+            result["refreshed"] = self.key_manager.last_refreshed
+            result["key_changed"] = self.key_manager.last_key_changed
+        result["current_fresh_key"] = numeric_fresh_key(self.fresh_key)
+        result["seconds_since_last_successful_acquisition"] = (
+            max(0, round(self.clock() - self.last_fresh_success_at, 3))
+            if self.last_fresh_success_at is not None else None)
+        if self.ledger is not None:
+            counts = self.ledger.counts()
+            result.update(fresh_get_today=counts["fresh_get"], list_get_today=counts["list_get"],
+                          remaining_gets=self.ledger.remaining())
+        return result
+
+    def round_freshness(self, result):
+        if result.page_observations:
+            headers = result.page_observations[0].get("response", {}).get("headers", {})
+            self.freshness_state["home_response"] = headers
+        return self.current_freshness()
+
+    def parameter_payload(self):
+        """Caller must already reserve its one GET in the shared ledger."""
+        if self.stopped():
+            raise WatchStopped("watch_stop_requested")
+        payload = get_json(FRESH_ENDPOINT, params=fresh_key_request_params(), timeout_seconds=self.timeout)
+        if self.stopped():
+            raise WatchStopped("watch_stop_requested")
+        # Fixed-mode diagnostics only accept the observed numeric parameter.
+        if numeric_fresh_key(parse_fresh_key(payload)) is None:
+            raise SourceProtocolError("numeric_refresh_parameter_required")
+        return payload
 
     def record_failure(self, event, exc):
         facts = {"error_type": type(exc).__name__, "requested_state": self.last_requested_state}
@@ -349,8 +433,31 @@ class WatchRunner:
                         self.write_state("paused", "insufficient_daily_round_budget")
                         return "paused"
                     self.write_state("starting", "fetching_initial_parameter")
-                    self.fresh_key = fetch_current_fresh_key(self.ledger, timeout=self.timeout, stopped=self.stopped)
+                    initial_at = self.clock()
+                    try:
+                        if self.refresh_policy.mode == "fixed":
+                            self.ledger.reserve_fresh(daily_fresh_limit=self.refresh_policy.daily_fresh_limit,
+                                                      list_reserve=self.max_pages)
+                            self.fresh_key = parse_fresh_key(self.parameter_payload())
+                        else:
+                            self.fresh_key = fetch_current_fresh_key(self.ledger, timeout=self.timeout, stopped=self.stopped)
+                    except Exception:
+                        self.freshness_state["reason"] = "initial_parameter_failed_stop"
+                        raise
+                    self.last_fresh_success_at = initial_at
+                    self.freshness_state.update(reason="initial_parameter_acquired", initial_acquired=True)
+                else:
+                    initial_at = None
+                if self.refresh_policy.mode == "fixed":
+                    from .freshness import RoundKeys
+                    if numeric_fresh_key(self.fresh_key) is None:
+                        raise SourceProtocolError("numeric_refresh_parameter_required")
+                    self.key_manager = RoundKeys(self.fresh_key, self.refresh_policy, self.ledger,
+                                                 self.parameter_payload, clock=self.clock)
+                    if initial_at is not None:
+                        self.key_manager.note_acquisition(initial_at)
                 adapter = BudgetAdapter(self.adapter_factory(self.fresh_key), self.ledger, self.stopped, self.max_pages)
+                adapter.diagnostic_fresh_key = numeric_fresh_key(self.fresh_key)
                 sender = BudgetNotifier(self.notifier, self.ledger, self.stopped)
                 monitor = WatchMonitor(adapter, self.store, sender, stopped=self.stopped,
                     baseline_pages=self.baseline_pages, coverage_pages=self.coverage_pages,
@@ -358,6 +465,7 @@ class WatchRunner:
                     missing_content_policy="require", uncertain_policy="notify-window",
                     max_alerts=self.max_alerts, clock=self.clock,
                     deep_candidate_ttl_seconds=self.deep_candidate_ttl_seconds)
+                monitor.freshness_report = self.round_freshness
                 while not self.stopped():
                     if self.attempted_pending():
                         self.write_state("paused", "attempted_pending_requires_review")
@@ -365,13 +473,31 @@ class WatchRunner:
                     if self.ledger.remaining() < self.max_pages:
                         self.write_state("paused", "insufficient_daily_round_budget")
                         return "paused"
-                    adapter.requests = 0
                     started = self.monotonic()
                     self.write_state("scanning", "bounded_round_started")
                     command = "check" if self.store.baseline_complete else "init"
-                    result = monitor.run_once(command, _lock_held=True)
+                    lease = nullcontext(self.fresh_key)
+                    if self.key_manager is not None:
+                        from .freshness import BudgetView, remaining_rounds_after_current
+                        counts = self.ledger.counts()
+                        budget = BudgetView(counts["fresh_get"] + counts["list_get"], counts["fresh_get"],
+                                            remaining_rounds_after_current(self.clock(), self.interval), self.max_pages)
+                        lease = self.key_manager.round(budget, self.freshness_state.get("home_response"))
+                    with lease as round_key:
+                        if self.key_manager is not None and self.key_manager.last_refreshed:
+                            self.last_fresh_success_at = self.key_manager._last_attempt_precise
+                        elif self.key_manager is None:
+                            self.freshness_state["reason"] = "process_mode"
+                        if round_key != self.fresh_key:
+                            adapter = BudgetAdapter(self.adapter_factory(round_key), self.ledger, self.stopped, self.max_pages)
+                            self.fresh_key = round_key
+                            adapter.diagnostic_fresh_key = numeric_fresh_key(round_key)
+                            monitor.adapter = adapter
+                        adapter.requests = 0
+                        result = monitor.run_once(command, _lock_held=True)
                     self.last_summary = result.to_dict()
                     self.rounds += 1
+                    self.freshness_state["initial_acquired"] = False
                     if self.stopped():
                         self.write_state("stopped", "stop_requested")
                         return "stopped"

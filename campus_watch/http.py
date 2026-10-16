@@ -129,7 +129,7 @@ def _capture_response_metadata(target: dict | None, status: object, getter) -> N
     if type(status) is int and 100 <= status <= 599:
         target["http_status"] = status
     safe: dict = {}
-    for name in ("Date", "Age", "Cache-Control", "Expires", "X-Cache", "Via", "ETag"):
+    for name in ("Date", "Age", "Cache-Control", "Expires", "X-Cache", "EO-Cache-Status", "Via", "ETag"):
         try:
             value = getter(name)
             if type(value) is not str or not value.strip():
@@ -185,7 +185,7 @@ def sanitize_response_metadata(metadata: object) -> dict:
     if type(headers) is not dict:
         return result
     safe = {}
-    for name in ("date", "age", "cache-control", "expires", "x-cache", "via", "etag"):
+    for name in ("date", "age", "cache-control", "expires", "x-cache", "eo-cache-status", "via", "etag"):
         value = headers.get(name)
         normalized = None
         if name in {"date", "expires"} and type(value) is str and len(value) <= 128:
@@ -201,7 +201,7 @@ def sanitize_response_metadata(metadata: object) -> dict:
                 elif directive in _CACHE_NUMBERS and type(item) is int and 0 <= item <= _MAX_HEADER_NUMBER:
                     directives[directive] = item
             normalized = directives or None
-        elif name == "x-cache" and type(value) is list and len(value) <= len(_CACHE_STATES):
+        elif name in ("x-cache", "eo-cache-status") and type(value) is list and len(value) <= len(_CACHE_STATES):
             states = []
             for item in value:
                 if type(item) is str and item in _CACHE_STATES and item not in states:

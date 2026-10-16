@@ -18,6 +18,15 @@ def main(argv=None):
         journal = Path(arguments[index + 1]).with_suffix(".runtime.jsonl")
     except (ValueError, IndexError):
         pass
+    if "--retry-alarm" in arguments:
+        try:
+            from campus_watch.alarm_recovery import recovery_path
+            event_id = arguments[arguments.index("--retry-alarm") + 1]
+            alarm_db = arguments[arguments.index("--alarm-db") + 1]
+            journal = recovery_path(alarm_db, event_id).with_suffix(".runtime.jsonl")
+            journal.parent.mkdir(parents=True, exist_ok=True)
+        except (ValueError, IndexError):
+            return 3
     spec = importlib.util.spec_from_file_location("_guard_runtime", ROOT / "campus_watch/runtime_evidence.py")
     evidence = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(evidence)
@@ -27,7 +36,8 @@ def main(argv=None):
     try:
         if not os.environ.get("BARK_KEY") and "--help" not in arguments:
             from campus_watch.local_secrets import load_bark_key
-            key = load_bark_key(journal.parent / "bark_key.dpapi") if journal else None
+            key_root = Path(arguments[arguments.index("--alarm-db") + 1]).resolve().parent if "--retry-alarm" in arguments else journal.parent if journal else None
+            key = load_bark_key(key_root / "bark_key.dpapi") if key_root else None
             if not key:
                 raise RuntimeError("Protected local notification key is unavailable.")
             os.environ["BARK_KEY"] = key

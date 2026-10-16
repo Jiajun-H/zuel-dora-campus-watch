@@ -1,4 +1,4 @@
-﻿param([ValidateSet('start','status','stop')][string]$Action = 'status')
+﻿param([ValidateSet('start','status','stop')][string]$Action = 'status', [string]$FreshnessConfig)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 
@@ -97,6 +97,20 @@ function Show-WatchState($view) {
         Write-Host ('异常退出告警：{0}；本次尝试 {1} 次；累计告警请求 {2} 次。' -f
             $view.guardian.alarm_state, $view.guardian.alarm_attempts, $view.guardian.alarm_requests)
     }
+    foreach ($retry in @($view.alarm_retries)) {
+        if (-not $retry) { continue }
+        if ($retry.state -eq 'sent') {
+            Write-Host ('异常告警已获 Bark 接受：{0}；累计尝试 {1} 次。' -f (Format-WatchTime $retry.notified_at), $retry.attempts)
+        } elseif ($retry.alive) {
+            Write-Host ('异常告警尚未送达，后台将继续补发；已尝试 {0} 次；下次：{1}。' -f $retry.attempts, (Format-WatchTime $retry.next_attempt_at)) -ForegroundColor Yellow
+        } else {
+            Write-Host '异常告警尚未送达，补发进程未运行，需要恢复补发。' -ForegroundColor Yellow
+        }
+        if ($retry.last_error_reason) {
+            $errorLabels = @{ transport_failure='网络连接或传输失败'; http_rejected='HTTP 请求被拒绝'; invalid_response='Bark 响应无效'; bark_rejected='Bark 拒绝通知'; delivery_failed='发送失败' }
+            Write-Host ('告警最近错误：{0}；HTTP：{1}；Bark：{2}。' -f $errorLabels[$retry.last_error_reason], $retry.http_status, $retry.bark_code)
+        }
+    }
     if ($view.guardian_failure.event -in 'unhandled_exception','ledger_cleanup_failed') {
         Write-Host ('守护故障类型：{0}；阶段：{1}。' -f $view.guardian_failure.error_type, $view.guardian_failure.stage)
     }
@@ -135,7 +149,9 @@ try {
             }
             Write-Host '正在准备启动；如需输入 Bark，请粘贴你自己的地址，输入不会显示。'
             $launchRequestedAt = ([DateTime]::UtcNow - [DateTime]'1970-01-01T00:00:00Z').TotalSeconds
-            $launch = ((& (Join-Path $PSScriptRoot 'StartRewardWatch.ps1') | Out-String) | ConvertFrom-Json)
+            $startSettings = @{}
+            if ($FreshnessConfig) { $startSettings.FreshnessConfig = $FreshnessConfig }
+            $launch = ((& (Join-Path $PSScriptRoot 'StartRewardWatch.ps1') @startSettings | Out-String) | ConvertFrom-Json)
             if ($launch.status -eq 'already_running') { Show-WatchState (Read-WatchState); return }
             if ($launch.status -ne 'launching') {
                 Write-Host '没有启动成功：请检查 Bark 输入与本机运行环境。' -ForegroundColor Yellow
