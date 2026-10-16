@@ -1,0 +1,5 @@
+{
+  "mode": "fixed",
+  "min_interval_seconds": 120,
+  "daily_fresh_limit": 720
+}
