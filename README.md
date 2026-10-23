@@ -35,7 +35,7 @@ uv run --locked python -m campus_watch demo
    uv sync --locked
    ~~~
 
-2. 准备本机正文解密配置 `data/body_cipher.local.json`。它不会随仓库分发，也不应提交到 Git。
+2. 正文解密参数已随仓库提供在 `data/body_cipher.local.json`，无需另行配置。
 3. 双击项目根目录的 `校圈监控.cmd`；也可以在 PowerShell 中运行：
 
    ~~~powershell
@@ -70,7 +70,7 @@ uv run --locked python -m campus_watch demo
 
 ## 数据与配置
 
-数据库、运行状态、日志、Bark 凭证和正文解密参数都保存在本机 `data/` 目录，该目录已从 Git 提交中排除。Bark Key 使用当前 Windows 用户的本机保护机制保存。不要把 `data/`、设备 Key 或运行数据库上传到公开仓库。
+运行数据库、状态、日志和 Bark 凭证保存在本机 `data/` 目录，不纳入 Git。正文解密参数是仓库公开配置，单独随项目分发；Bark Key 使用当前 Windows 用户的本机保护机制保存。不要上传设备 Key 或运行数据库。
 
 监控只适用于你有权访问的内容。请遵守来源平台规则，并根据本地状态确认运行和通知结果。
 

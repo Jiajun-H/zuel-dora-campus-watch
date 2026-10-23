@@ -5,6 +5,9 @@ __pycache__/
 .env.*
 !.env.example
 data/
+!data/
+data/*
+!data/body_cipher.local.json
 *.sqlite3
 *.sqlite3-*
 *.db
