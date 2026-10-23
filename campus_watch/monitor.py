@@ -1,4 +1,4 @@
-"""Bounded ID observation, atomic confirmed frontiers, and retryable delivery."""
+"""Bounded latest-window observation, persistent ID deduplication, and delivery."""
 
 from __future__ import annotations
 
@@ -83,8 +83,8 @@ class Monitor:
         confirmed_notifications: bool | None = None,
         missing_content_policy: str | None = None, body_wait_seconds: int = 120,
         baseline_pages: int = 1, coverage_pages: int | None = None,
-        max_observation_gap_seconds: int = 900, uncertain_policy: str = "hold",
-        deep_candidate_ttl_seconds: int = 900, diagnostic_clock: Callable[[], float] = time.time,
+        max_observation_gap_seconds: int = 900, uncertain_policy: str = "notify-window",
+        diagnostic_clock: Callable[[], float] = time.time,
     ) -> None:
         if not 1 <= max_pages_per_poll <= 5:
             raise ValueError("max_pages_per_poll must be 1..5")
@@ -106,9 +106,7 @@ class Monitor:
             raise ValueError("observation gap bound must be 1..86400 seconds")
         if uncertain_policy not in ("hold", "notify-window"):
             raise ValueError("uncertain notification policy must be hold or notify-window")
-        if type(deep_candidate_ttl_seconds) is not int or not 0 <= deep_candidate_ttl_seconds <= 3600:
-            raise ValueError("deep candidate lifetime must be 0..3600 seconds")
-        self.deep_candidate_ttl_seconds, self.diagnostic_clock = deep_candidate_ttl_seconds, diagnostic_clock
+        self.diagnostic_clock = diagnostic_clock
         self.baseline_pages, self.coverage_pages = baseline_pages, coverage_pages
         self.max_observation_gap_seconds, self.uncertain_policy = max_observation_gap_seconds, uncertain_policy
         self.body_policy, self.body_wait_seconds = missing_content_policy, body_wait_seconds
@@ -279,88 +277,28 @@ class Monitor:
         uncertain_ids: set[int] = set()
         degraded_ids: set[int] = set()
         reasons: dict[int, str] = {}
-        deferred_ids: set[int] = set()
-        promoted_ids: set[int] = set()
-        continuous = False
-        candidate_supported = False
         absence_reference = run_id if terminal else None
         if not baseline:
             known = self.store.known_ids()
             unknown = {post.post_id for post in posts if post.post_id not in known}
-            prior_order = list(snapshot["order"])
+            uncertain_ids = set(unknown)
             continuous = (now >= int(snapshot["observed_at"]) and
                           completed_at - int(snapshot["observed_at"]) <= self.max_observation_gap_seconds)
             if not continuous:
                 result.coverage_gap = True
-                result.warnings.append("observation_gap_exceeds_confirmation_bound")
-            # Exhausting the preceding visible history proves an unseen ID was
-            # absent then. Publication timestamp and ID magnitude are irrelevant.
-            prior_reference = snapshot.get("absence_reference_run_id") or (
-                snapshot.get("run_id") if snapshot["terminal"] else None
-            )
-            # A missing old anchor breaks the chain of exhaustive coverage.
-            # Stable window overlap supports only an uncertain observation,
-            # even if the preceding snapshot had reached an empty tail.
-            if result.anchor_quorum_used:
-                prior_reference = None
-            if prior_reference is not None and continuous:
-                uncertain_ids = unknown & self.store.previously_observed_before_reference(prior_reference)
-                confirmed_ids = unknown - uncertain_ids
-                reasons = {post_id: "observed_before_absence_reference" for post_id in uncertain_ids}
-                absence_reference = prior_reference
+                result.warnings.append("observation_gap_silently_resynchronized")
+                reasons = {post_id: "observation_gap_silent_sync" for post_id in unknown}
             else:
-                uncertain_ids = unknown
-                default_reason = "observation_gap" if not continuous else "previous_coverage_partial"
-                reasons = {post_id: default_reason for post_id in uncertain_ids}
-                ordinary_order = [post.post_id for post in posts if post.top == 0]
-                current_anchors = [post_id for post_id in ordinary_order if post_id in set(prior_order)]
-                expected_anchors = [post_id for post_id in prior_order if post_id in set(current_anchors)]
-                anchor_order_stable = current_anchors == expected_anchors
-                if not anchor_order_stable:
-                    result.warnings.append("known_anchor_order_changed_partial_proof")
-                # A known former tail that is now pinned cannot enlarge the
-                # ordinary window. Shrink to the deepest still-ordinary anchor.
-                old_tail = current_anchors[-1] if anchor_order_stable and current_anchors else None
-                within_old_tail: set[int] = set()
-                if old_tail in ordinary_order:
-                    within_old_tail = set(ordinary_order[:ordinary_order.index(old_tail) + 1])
-                for post_id in uncertain_ids - within_old_tail:
-                    reasons[post_id] = "outside_previous_visible_window"
-                if (
-                    self.uncertain_policy == "notify-window" and continuous
-                    and prior_reference is None and anchor_order_stable
-                    and len(current_anchors) >= result.required_anchor_count
-                    and len(current_anchors) >= 2 and old_tail in ordinary_order
-                ):
-                    previously_observed = self.store.previously_observed_before_reference(snapshot["run_id"])
-                    degraded_ids = (uncertain_ids & within_old_tail & set(order)) - previously_observed
-                    for post_id in uncertain_ids & previously_observed:
-                        reasons[post_id] = "observed_before_window_reference"
-                    for post_id in degraded_ids:
-                        reasons[post_id] = "bounded_window_first_seen_unconfirmed"
-                if uncertain_ids:
-                    result.warnings.append("first_seen_visibility_uncertain_not_new_publication_proof")
-            # Existing deep candidates remain explicitly uncertain even when
-            # this round also has an exhaustive reference for other unknowns.
-            # Every successful link in their lifetime must remain supported.
-            ordinary_order = [p.post_id for p in posts if p.top == 0]
-            anchors = [i for i in ordinary_order if i in set(prior_order)]
-            expected = [i for i in prior_order if i in set(anchors)]
-            candidate_supported = (
-                self.uncertain_policy == "notify-window" and continuous
-                and len(anchors) >= max(2, (3 * len(prior_order) + 3) // 4)
-                and anchors == expected and bool(set(anchors) & set(order))
-                and requested_pages == int(snapshot["pages"])
-            )
-            if candidate_supported and self.deep_candidate_ttl_seconds:
-                boundary = set(ordinary_order[:ordinary_order.index(anchors[-1]) + 1])
-                active = self.store.deep_window_candidates
-                promoted_ids = set(active) & boundary & set(order)
-                promoted_ids = {i for i in promoted_ids if completed_at < active[i]["expires_at"]}
-                if prior_reference is None:
-                    previously_observed = self.store.previously_observed_before_reference(snapshot["run_id"])
-                    deferred_ids = (uncertain_ids - set(order) - previously_observed)
-                    deferred_ids &= {p.post_id for p in posts if p.top == 0}
+                degraded_ids = {
+                    post.post_id for post in posts
+                    if post.post_id in unknown and post.top == 0
+                }
+                reasons = {
+                    post_id: "latest_window_first_seen"
+                    for post_id in unknown
+                }
+                if unknown:
+                    result.warnings.append("first_seen_window_drives_notifications")
         new, suppressed, expanded = self.store.commit_visibility_observation(
             posts, frontier, run_id, now=now, observed_completed_at=completed_at,
             baseline=baseline, snapshot_order=order, snapshot_terminal=terminal,
@@ -368,29 +306,24 @@ class Monitor:
             uncertainty_reasons=reasons, degraded_ids=degraded_ids,
             body_wait_seconds=self.body_wait_seconds,
             absence_reference_run_id=absence_reference,
-            deferred_ids=deferred_ids, promoted_ids=promoted_ids,
-            candidate_ttl_seconds=self.deep_candidate_ttl_seconds if self.uncertain_policy == "notify-window" else 0,
-            candidate_continuous=candidate_supported, candidate_pages=self._post_pages,
-            candidate_cancel_reason="deep_candidate_coverage_interrupted" if continuous else "deep_candidate_observation_gap",
         )
         self._visibility_committed = True
         outcome = self.store.last_candidate_outcome
         for name in ("created", "promoted", "expired", "cancelled"):
             setattr(result, f"deep_candidate_{name}_count", outcome[f"{name}_count"])
         result.deep_candidate_events = outcome["events"]
-        result.coverage = ("bounded_window_anchor_quorum" if result.anchor_quorum_used else
-                           "terminal_visible_traversal" if terminal else "bounded_visible_window")
+        result.coverage = "terminal_visible_traversal" if terminal else "bounded_visible_window"
         if baseline:
             result.status = "rebaselined" if command == "rebaseline" else "baseline"
             result.warnings.append("baseline_is_silent_existing_delivery_states_preserved")
             if not terminal:
-                result.warnings.append("baseline_window_partial_first_seen_requires_uncertainty_policy")
+                result.warnings.append("baseline_window_is_silent_until_next_observation")
             return
         result.new_count, result.suppressed_count, result.baseline_expanded_count = len(new), suppressed, expanded
         actual_states = self.store.visibility_counts_for_ids(unknown)
         result.confirmed_visible_count = actual_states.get("newly_observed_confirmed", 0)
         result.uncertain_first_seen_count = actual_states.get("uncertain_first_seen", 0)
-        result.degraded_eligible_count = self.store.confirmed_count_for_ids(degraded_ids | promoted_ids)
+        result.degraded_eligible_count = self.store.confirmed_count_for_ids(degraded_ids)
         result.window_new_count = result.degraded_eligible_count
         result.confirmed_new_count = self.store.confirmed_count_for_ids(confirmed_ids)
         result.new_posts = [{"post_id": post.post_id, "created_at": post.created_at,
@@ -401,15 +334,7 @@ class Monitor:
     def _visibility_scan(
         self, result: PollSummary, window_pages: int, *, snapshot: dict | None,
     ) -> tuple[list[ForumPost], set[int], list[int], bool, int]:
-        """Collect a bounded snapshot with no timestamp or ID ordering gate.
-
-        Prefer finding all previous anchors. Daily window mode can tolerate
-        missing IDs using stable ordinary overlap at the existing page limit.
-        A newly pinned old ID never lowers that overlap's fixed denominator.
-        IDs are used only as source-provided cursors.
-        Extra continuity/lookback pages are recorded as observations but do not
-        silently enlarge the persisted window and next run's request budget.
-        """
+        """Collect exactly the configured latest window, keeping anchors diagnostic only."""
         required = set(snapshot["order"]) if snapshot is not None else set()
         self._diagnostic_window_pages = window_pages
         seen_anchors: set[int] = set()
@@ -419,37 +344,16 @@ class Monitor:
         window_order: list[int] = []
         first_frontier: set[int] = set()
         cursor = -1
-        overlap_page: int | None = None
-        quorum_page: int | None = None
+        result.previous_anchor_count = len(snapshot["order"]) if snapshot is not None else 0
+        result.required_anchor_count = max(2, (3 * result.previous_anchor_count + 3) // 4) if required else 0
 
-        def stable_quorum() -> bool:
-            prior = list(snapshot["order"]) if snapshot is not None else []
-            ordinary_order = [post.post_id for post in collected.values() if post.top == 0]
-            ordinary_anchors = [post_id for post_id in ordinary_order if post_id in required]
-            expected = [post_id for post_id in prior if post_id in set(ordinary_anchors)]
-            result.previous_anchor_count = len(prior)
-            result.required_anchor_count = max(2, (3 * len(prior) + 3) // 4) if prior else 0
-            result.ordinary_anchor_count = len(ordinary_anchors)
+        def update_anchor_diagnostics() -> None:
+            ordinary_order = [post_id for post_id in window_order]
+            anchors = [post_id for post_id in ordinary_order if post_id in required]
+            result.ordinary_anchor_count = len(anchors)
             result.missing_anchor_count = len(required - seen_anchors)
-            result.missing_anchor_ids = [post_id for post_id in prior if post_id not in seen_anchors][:100]
-            split = (len(prior) + 1) // 2
-            supporting = set(ordinary_anchors)
-            return (
-                self.uncertain_policy == "notify-window" and bool(prior)
-                and len(ordinary_anchors) >= result.required_anchor_count
-                and ordinary_anchors == expected
-                and bool(supporting & set(prior[:split]))
-                and bool(supporting & set(prior[split:]))
-                and bool(supporting & set(window_order))
-            )
-
-        def accept_quorum(index: int) -> bool:
-            if (stable_quorum() and quorum_page is not None
-                    and index >= window_pages and index >= quorum_page + self.lookback_pages):
-                result.anchor_quorum_used = True
-                result.warnings.append("stable_window_overlap_missing_old_anchors")
-                return True
-            return False
+            prior_order = list(snapshot["order"]) if snapshot is not None else []
+            result.missing_anchor_ids = [post_id for post_id in prior_order if post_id not in seen_anchors][:100]
 
         for index in range(1, self.max_pages + 1):
             if cursor in seen_cursors:
@@ -460,16 +364,8 @@ class Monitor:
             if not page.posts:
                 if page.next_cursor is not None:
                     raise IncompleteScan("empty_page_has_unverified_cursor")
-                stable_quorum()
-                if required - seen_anchors:
-                    if accept_quorum(index):
-                        # Do not create an exhaustive absence reference across
-                        # an incomplete anchor link, including at an empty tail.
-                        return list(collected.values()), first_frontier, window_order, False, min(index, window_pages)
-                    raise IncompleteScan("visibility_anchors_missing_at_empty_tail")
-                # The remote empty tail is evidence for this completed scan;
-                # no claim about deleted/unapproved/private posts follows.
-                return list(collected.values()), first_frontier, window_order, True, min(index, window_pages)
+                update_anchor_diagnostics()
+                return list(collected.values()), first_frontier, window_order, True, index
             if not ordinary:
                 raise IncompleteScan("pinned_only_page_cursor_unknown")
             if index == 1:
@@ -487,25 +383,13 @@ class Monitor:
                 collected[post.post_id] = post
             self._partial_posts = dict(collected)
             seen_ordinary.update(ordinary_ids)
-            if index <= window_pages:
-                window_order.extend(ordinary_ids)
-            seen_anchors.update(set(collected) & required)
-            if stable_quorum() and quorum_page is None:
-                quorum_page = index
-            if seen_anchors == required and overlap_page is None:
-                overlap_page = index
-            if snapshot is None:
-                if index >= window_pages:
-                    return list(collected.values()), first_frontier, window_order, False, window_pages
-            elif (
-                index >= window_pages and overlap_page is not None
-                and index >= overlap_page + self.lookback_pages
-            ):
-                return list(collected.values()), first_frontier, window_order, False, window_pages
-            elif index == self.max_pages and accept_quorum(index):
-                return list(collected.values()), first_frontier, window_order, False, window_pages
+            window_order.extend(ordinary_ids)
+            seen_anchors.update(set(ordinary_ids) & required)
+            update_anchor_diagnostics()
+            if index >= window_pages:
+                return list(collected.values()), first_frontier, window_order, False, index
             cursor = page.next_cursor
-        raise IncompleteScan("page_limit_visibility_coverage_not_completed")
+        raise IncompleteScan("configured_visibility_window_not_completed")
 
     def _fetch(self, cursor: int, result: PollSummary):
         if self.adapter is None:

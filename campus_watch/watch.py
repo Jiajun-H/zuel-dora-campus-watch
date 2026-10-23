@@ -247,8 +247,7 @@ class WatchRunner:
                  stop_path: Path, ledger_path: Path, interval=60, daily_get_limit=4320,
                  baseline_pages=2, coverage_pages=2, max_pages=3, max_alerts=20,
                  fresh_key=None, fetch_fresh=False, timeout=10, clock=time.time,
-                 monotonic=time.monotonic, sleeper=None, deep_candidate_ttl_seconds=900,
-                 refresh_policy=None):
+                 monotonic=time.monotonic, sleeper=None, refresh_policy=None):
         from .freshness import RefreshPolicy
         self.refresh_policy = refresh_policy or RefreshPolicy()
         if (not isinstance(self.refresh_policy, RefreshPolicy)
@@ -266,9 +265,6 @@ class WatchRunner:
             raise ValueError("watch interval must be at least 60 seconds")
         if not 1 <= baseline_pages <= max_pages <= 3 or not 1 <= coverage_pages <= max_pages:
             raise ValueError("watch requires a bounded 1..3 page window")
-        if type(deep_candidate_ttl_seconds) is not int or not 0 <= deep_candidate_ttl_seconds <= 3600:
-            raise ValueError("deep candidate lifetime must be 0..3600 seconds")
-        self.deep_candidate_ttl_seconds = deep_candidate_ttl_seconds
         self.store, self.adapter_factory, self.notifier = store, adapter_factory, notifier
         self.state_path, self.stop_path, self.ledger_path = map(Path, (state_path, stop_path, ledger_path))
         self.failure_path = self.state_path.with_suffix(".failures.jsonl")
@@ -463,8 +459,7 @@ class WatchRunner:
                     baseline_pages=self.baseline_pages, coverage_pages=self.coverage_pages,
                     max_pages_per_poll=self.max_pages, lookback_pages=0,
                     missing_content_policy="require", uncertain_policy="notify-window",
-                    max_alerts=self.max_alerts, clock=self.clock,
-                    deep_candidate_ttl_seconds=self.deep_candidate_ttl_seconds)
+                    max_alerts=self.max_alerts, clock=self.clock)
                 monitor.freshness_report = self.round_freshness
                 while not self.stopped():
                     if self.attempted_pending():

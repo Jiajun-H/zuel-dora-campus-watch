@@ -5,6 +5,7 @@ description = "Bounded single-run campus post detection with SQLite and Bark"
 requires-python = ">=3.12"
 dependencies = [
     "cryptography>=50.0.2",
+    "textual>=8.2.8,<9",
 ]
 
 [tool.uv]

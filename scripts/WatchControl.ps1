@@ -92,6 +92,9 @@ function Show-WatchState($view) {
     elseif ($view.guardian -and $view.guardian.state -in 'starting','watching','notifying') {
         Write-Host '异常退出提醒守护也已消失，未完成告警；不能保证退出提醒送达。' -ForegroundColor Yellow
         if ($view.guardian.updated_at) { Write-Host ('守护最后更新时间：{0}' -f (Format-WatchTime $view.guardian.updated_at)) }
+        if ($view.guardian.alarm_state -eq 'none') {
+            Write-Host '本次中断没有生成告警记录；历史通知成功不代表本次已通知。' -ForegroundColor Yellow
+        }
     }
     if ($view.guardian -and $view.guardian.alarm_state -ne 'none') {
         Write-Host ('异常退出告警：{0}；本次尝试 {1} 次；累计告警请求 {2} 次。' -f
@@ -100,7 +103,11 @@ function Show-WatchState($view) {
     foreach ($retry in @($view.alarm_retries)) {
         if (-not $retry) { continue }
         if ($retry.state -eq 'sent') {
-            Write-Host ('异常告警已获 Bark 接受：{0}；累计尝试 {1} 次。' -f (Format-WatchTime $retry.notified_at), $retry.attempts)
+            if ($view.guardian.alarm_event_id -and $view.guardian.alarm_event_id -eq $retry.alarm_event_id) {
+                Write-Host ('本次异常告警已获 Bark 接受：{0}；累计尝试 {1} 次。' -f (Format-WatchTime $retry.notified_at), $retry.attempts)
+            } else {
+                Write-Host ('历史异常告警已获 Bark 接受：{0}；累计尝试 {1} 次，与本次监控无关。' -f (Format-WatchTime $retry.notified_at), $retry.attempts)
+            }
         } elseif ($retry.alive) {
             Write-Host ('异常告警尚未送达，后台将继续补发；已尝试 {0} 次；下次：{1}。' -f $retry.attempts, (Format-WatchTime $retry.next_attempt_at)) -ForegroundColor Yellow
         } else {

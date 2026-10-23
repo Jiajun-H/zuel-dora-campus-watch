@@ -72,19 +72,17 @@ def main(argv: list[str] | None = None) -> int:
                         help="显式传入freshKey对应分类，悬赏必须为14")
     parser.add_argument("--max-pages", type=int, choices=range(1, 6), default=3)
     parser.add_argument("--baseline-pages", type=int, choices=range(1, 6), default=1,
-                        help="静默基线固定页数；窗口提醒无需空尾，严格确认才需要尾部参考")
+                        help="启动时静默同步的固定页数")
     parser.add_argument("--coverage-pages", type=int, choices=range(1, 6), default=None,
-                        help="每次主要覆盖深度；仍须找齐旧锚点及回看，不自动扩预算")
+                        help="每次悬赏列表固定扫描页数；默认沿用静默基线页数，最多受每轮列表预算限制")
     parser.add_argument("--max-observation-gap-seconds", type=int, default=900,
-                        help="超过此观测间隔的新发现默认为不确定；不使用提交时间判断")
+                        help="超过此观测间隔时静默同步当前窗口，不补发停机期间历史")
     parser.add_argument("--uncertain-policy", choices=("hold", "notify-window"), default="notify-window",
-                        help="默认有限窗口提醒，诊断保留不确定资格；hold保留严格覆盖确认")
-    parser.add_argument("--deep-candidate-ttl-seconds", type=int, default=900,
-                        help="深页初见候选固定有效期0..3600秒，默认900；0关闭，旧历史不补推")
+                        help="默认通知窗口内首次见帖；hold保留候选但不发送")
     parser.add_argument("--post-id", type=int, help="diagnose只读查看指定帖子首次观测前10分钟至后1小时的被动诊断")
     parser.add_argument("--backup", type=Path, help="显式迁移使用的新备份路径，不覆盖已有备份")
     parser.add_argument("--lookback-pages", type=int, choices=(0, 1, 2), default=None,
-                        help="额外回看页数；窗口模式默认0，严格/全部模式默认1；仍须找齐旧锚点")
+                        help="额外回看页数；全部帖子模式使用，悬赏最新窗口不回看")
     parser.add_argument("--old-window-hours", type=int, choices=range(0, 721), default=24,
                         help="init时固定：历史首次可见候选记录窗口；不扩大正式时间资格")
     parser.add_argument("--max-alerts", type=int, choices=range(1, 101), default=30)
@@ -155,7 +153,6 @@ def main(argv: list[str] | None = None) -> int:
                     baseline_pages=args.baseline_pages, coverage_pages=args.coverage_pages or args.baseline_pages,
                     max_pages=args.max_pages, max_alerts=args.max_alerts,
                     fresh_key=fresh, fetch_fresh=args.fetch_fresh_key, timeout=args.timeout,
-                    deep_candidate_ttl_seconds=args.deep_candidate_ttl_seconds,
                     refresh_policy=refresh_policy)
                 outcome = runner.run()
                 emit({"status": outcome, "message": "watch已结束；只读状态JSON确认原因。"})
@@ -311,8 +308,7 @@ def main(argv: list[str] | None = None) -> int:
                               body_wait_seconds=args.body_wait_seconds,
                               baseline_pages=args.baseline_pages, coverage_pages=args.coverage_pages,
                               max_observation_gap_seconds=args.max_observation_gap_seconds,
-                              uncertain_policy=args.uncertain_policy,
-                              deep_candidate_ttl_seconds=args.deep_candidate_ttl_seconds).run_once(args.command)
+                              uncertain_policy=args.uncertain_policy).run_once(args.command)
             emit(summary.to_dict())
         return {"baseline": 0, "rebaselined":0, "already_initialized": 0, "ok": 0,
                 "partial": 3, "incomplete": 4, "busy": 5}.get(summary.status, 1)

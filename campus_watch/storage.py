@@ -544,17 +544,8 @@ class SQLiteStore:
         uncertain_ids: set[int], uncertainty_reasons: dict[int, str],
         degraded_ids: set[int] = frozenset(), body_wait_seconds: int = 120,
         absence_reference_run_id: int | None = None,
-        deferred_ids: set[int] = frozenset(), promoted_ids: set[int] = frozenset(),
-        candidate_ttl_seconds: int = 0, candidate_continuous: bool = False,
-        candidate_pages: dict[int, int] | None = None,
-        candidate_cancel_reason: str = "deep_candidate_observation_gap",
     ) -> tuple[list[ForumPost], int, int]:
-        """Apply a completed visibility proof supplied by the scanner.
-
-        No creation timestamp or numeric ID comparison grants eligibility.
-        Existing history never gains one, except an explicitly registered,
-        unexpired deep candidate entering a supported ordinary main window.
-        """
+        """Commit one complete bounded window and its first-seen decisions atomically."""
         self._require_lock()
         if self.discovery_policy != "visibility" or self.target_category != 14:
             raise StoreError("visibility commit requires a visibility reward database")
@@ -573,18 +564,7 @@ class SQLiteStore:
             raise StoreError("visibility proof contains unobserved IDs")
         if confirmed_ids & uncertain_ids or confirmed_ids & set(degraded_ids):
             raise StoreError("visibility proof classifications conflict")
-        if (type(candidate_ttl_seconds) is not int or not 0 <= candidate_ttl_seconds <= 3600
-                or type(candidate_continuous) is not bool
-                or not set(deferred_ids) <= ordinary - set(snapshot_order)
-                or not set(promoted_ids) <= set(snapshot_order) - confirmed_ids
-                or set(deferred_ids) & (confirmed_ids | set(degraded_ids))):
-            raise StoreError("invalid deep candidate decision")
-        candidate_pages = candidate_pages or {}
-        if any(type(candidate_pages.get(i)) is not int or not 1 <= candidate_pages[i] <= 5 for i in deferred_ids):
-            raise StoreError("deep candidate requires an observed page")
         safe_reasons = {post_id: self._visibility_reason(reason) for post_id, reason in uncertainty_reasons.items()}
-        if candidate_cancel_reason not in ("deep_candidate_observation_gap", "deep_candidate_coverage_interrupted"):
-            raise StoreError("invalid deep candidate cancellation reason")
         previous = self.visibility_snapshot
         if not baseline and previous is None:
             raise StoreError("visibility baseline proof is required")
@@ -605,60 +585,23 @@ class SQLiteStore:
         new_posts = []
         suppressed = expanded = 0
         registry = self.deep_window_candidates
-        epoch_value = self._state("deep_candidate_policy_v1_since_run")
-        if epoch_value is not None and not re.fullmatch(r"[1-9][0-9]*", epoch_value):
-            raise StoreError("invalid deep candidate policy epoch")
-        candidate_epoch = int(epoch_value) if epoch_value is not None else run_id
         outcome = {"created_count": 0, "promoted_count": 0, "expired_count": 0,
-                   "cancelled_count": 0, "events": []}
-        def event(post_id, reason):
-            if len(outcome["events"]) < 200:
-                outcome["events"].append({"post_id": post_id, "reason": reason})
-        def retire(post_id, reason, kind):
-            registry.pop(post_id, None)
-            self._connection.execute(
-                "UPDATE posts SET visibility_reason=?,notification_reason=? WHERE post_id=? "
-                "AND status='older_discovered' AND notification_eligible=0",
-                (reason, reason, post_id),
-            )
-            outcome[kind] += 1
-            event(post_id, reason)
+                   "cancelled_count": len(registry),
+                   "events": [{"post_id": post_id, "reason": "deep_candidate_disabled"}
+                              for post_id in list(registry)[:200]]}
         with self._connection:
-            for post_id, item in list(registry.items()):
-                if baseline or not candidate_continuous or not candidate_ttl_seconds:
-                    reason = ("deep_candidate_rebaseline" if baseline else
-                              "deep_candidate_disabled" if not candidate_ttl_seconds else candidate_cancel_reason)
-                    retire(post_id, reason, "cancelled_count")
-                elif observed_completed_at >= item["expires_at"]:
-                    retire(post_id, "deep_candidate_expired", "expired_count")
+            for post_id in registry:
+                self._connection.execute(
+                    "UPDATE posts SET visibility_reason='deep_candidate_disabled',"
+                    "notification_reason='deep_candidate_disabled' WHERE post_id=? "
+                    "AND status='older_discovered' AND notification_eligible=0",
+                    (post_id,),
+                )
             for post in projected:
                 existing = self._connection.execute(
                     "SELECT status,attempts,notification_eligible,delivery_mode,send_started_at,visibility_reason,batch_id "
                     "FROM posts WHERE post_id=?", (post.post_id,)).fetchone()
                 if existing:
-                    body_status = getattr(getattr(post, "body", None), "status", "missing")
-                    if post.post_id in registry and (post.top != 0 or not self._reward_category_ok(post)
-                            or body_status in ("invalid", "unknown_format", "unverified")):
-                        retire(post.post_id, "deep_candidate_contract_lost", "cancelled_count")
-                    entry = registry.get(post.post_id)
-                    if (post.post_id in promoted_ids and entry is not None
-                            and existing["status"] == "older_discovered" and not existing["notification_eligible"]
-                            and existing["attempts"] == 0 and existing["delivery_mode"] == ""
-                            and existing["send_started_at"] is None and existing["batch_id"] == entry["first_run_id"]
-                            and existing["visibility_reason"] == "deep_first_seen_candidate"):
-                        self._connection.execute(
-                            "UPDATE posts SET status='pending',notification_eligible=1,"
-                            "notification_reason='deep_candidate_entered_main_window',"
-                            "visibility_reason='deep_candidate_entered_main_window',visibility_previous_run_id=?,"
-                            "confirmation_since=?,confirmation_observed_at=?,summary=?,url=? WHERE post_id=?",
-                            (previous_run, previous_at, observed_completed_at, post.summary, post.url, post.post_id),
-                        )
-                        self._insert_reward_body(post, eligible=True, observed_at=observed_completed_at,
-                                                 body_wait_seconds=body_wait_seconds)
-                        registry.pop(post.post_id)
-                        outcome["promoted_count"] += 1
-                        event(post.post_id, "deep_candidate_entered_main_window")
-                        new_posts.append(post)
                     self._refresh_existing_reward(post, observed_completed_at)
                     continue
                 category_ok = self._reward_category_ok(post)
@@ -672,28 +615,10 @@ class SQLiteStore:
                 if not baseline and (not category_ok or post.top != 0):
                     reason = "pinned_visibility_unverified" if post.top else "category_unverified_or_not_reward"
                 status = "baseline" if baseline else "pending" if eligible else "older_discovered"
-                partial_origin = self._connection.execute(
-                    "SELECT MIN(observed_at),MIN(run_id) FROM partial_diagnostics WHERE post_id=?", (post.post_id,)
-                ).fetchone()
-                first_partial, first_partial_run = partial_origin
+                first_partial = self._connection.execute(
+                    "SELECT MIN(observed_at) FROM partial_diagnostics WHERE post_id=?", (post.post_id,)
+                ).fetchone()[0]
                 first_seen = min(first_partial, observed_completed_at) if first_partial is not None else observed_completed_at
-                if (post.post_id in deferred_ids and candidate_continuous and candidate_ttl_seconds
-                        and not baseline and not eligible and category_ok and post.top == 0
-                        and getattr(getattr(post, "body", None), "status", "missing") not in ("invalid", "unknown_format", "unverified")
-                        and first_seen + candidate_ttl_seconds > observed_completed_at):
-                    if first_partial_run is not None and first_partial_run < candidate_epoch:
-                        reason = "observed_before_deep_candidate_policy"
-                        event(post.post_id, reason)
-                    elif len(registry) < 1000:
-                        registry[post.post_id] = {"first_run_id": run_id, "first_seen_at": first_seen,
-                                                 "expires_at": first_seen + candidate_ttl_seconds,
-                                                 "first_page": candidate_pages[post.post_id]}
-                        reason = "deep_first_seen_candidate"
-                        outcome["created_count"] += 1
-                        event(post.post_id, reason)
-                    else:
-                        reason = "deep_candidate_limit_reached"
-                        event(post.post_id, reason)
                 self._connection.execute(
                     "INSERT INTO posts(post_id,created_at,top,source_school,first_seen_at,batch_id,status,summary,url,notification_eligible,"
                     "confirmation_since,confirmation_observed_at,notification_reason,visibility_state,visibility_reason,visibility_previous_run_id,"
@@ -708,11 +633,8 @@ class SQLiteStore:
                     new_posts.append(post)
                 elif not baseline:
                     suppressed += 1
-            self._set_state("deep_window_candidates_v1", json.dumps(registry))
-            if candidate_ttl_seconds and self._state("deep_candidate_policy_v1_since_run") is None:
-                self._set_state("deep_candidate_policy_v1_since_run", str(run_id))
-            elif not candidate_ttl_seconds:
-                self._connection.execute("DELETE FROM app_state WHERE key='deep_candidate_policy_v1_since_run'")
+            self._set_state("deep_window_candidates_v1", "{}")
+            self._connection.execute("DELETE FROM app_state WHERE key='deep_candidate_policy_v1_since_run'")
             if baseline:
                 self._set_state("baseline_at", str(now))
                 self._set_state("old_window_seconds", "0")
