@@ -85,6 +85,7 @@ class Monitor:
         baseline_pages: int = 1, coverage_pages: int | None = None,
         max_observation_gap_seconds: int = 900, uncertain_policy: str = "notify-window",
         diagnostic_clock: Callable[[], float] = time.time,
+        first_attempt_only: bool = False,
     ) -> None:
         if not 1 <= max_pages_per_poll <= 5:
             raise ValueError("max_pages_per_poll must be 1..5")
@@ -107,6 +108,7 @@ class Monitor:
         if uncertain_policy not in ("hold", "notify-window"):
             raise ValueError("uncertain notification policy must be hold or notify-window")
         self.diagnostic_clock = diagnostic_clock
+        self.first_attempt_only = first_attempt_only
         self.baseline_pages, self.coverage_pages = baseline_pages, coverage_pages
         self.max_observation_gap_seconds, self.uncertain_policy = max_observation_gap_seconds, uncertain_policy
         self.body_policy, self.body_wait_seconds = missing_content_policy, body_wait_seconds
@@ -546,7 +548,8 @@ class Monitor:
         counts = self.store.delivery_counts()
         if self.visibility_mode:
             result.body_ready_count = len(self.store.pending_posts(
-                1000000, confirmed_only=True, body_policy="require", visibility_policy=self.uncertain_policy))
+                1000000, confirmed_only=True, body_policy="require", visibility_policy=self.uncertain_policy,
+                first_attempt_only=self.first_attempt_only))
             result.policy_blocked_pending_count = self.store.visibility_policy_blocked_count(self.uncertain_policy)
             if result.policy_blocked_pending_count:
                 result.warnings.append("window_pending_held_by_strict_policy")
@@ -568,6 +571,7 @@ class Monitor:
             require_summary=self.confirmed_notifications and not self.reward_mode,
             body_policy=self.body_policy, now=int(self.clock()) if self.reward_mode else None,
             visibility_policy=self.uncertain_policy if self.visibility_mode else None,
+            first_attempt_only=self.first_attempt_only,
         ):
             if self.reward_mode:
                 body = post.body
@@ -597,7 +601,8 @@ class Monitor:
         if len(self.store.pending_posts(1, confirmed_only=self.confirmed_notifications,
                                        require_summary=self.confirmed_notifications and not self.reward_mode,
                                        body_policy=self.body_policy, now=int(self.clock()) if self.reward_mode else None,
-                                       visibility_policy=self.uncertain_policy if self.visibility_mode else None)) and result.retry_failures == 0:
+                                       visibility_policy=self.uncertain_policy if self.visibility_mode else None,
+                                       first_attempt_only=self.first_attempt_only)) and result.retry_failures == 0:
             result.warnings.append("notification_budget_reached_pending_preserved")
         if self.reward_mode and self.body_policy == "wait" and counts["deferred_missing_summary_count"]:
             if self.store.pending_count:

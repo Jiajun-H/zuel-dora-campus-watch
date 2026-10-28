@@ -205,7 +205,7 @@ def read_database_snapshot(path: str | Path, *, limit: int = 100) -> DatabaseSna
                 "COALESCE(SUM(status='baseline'),0) AS baseline_count,"
                 "COALESCE(SUM(status IN ('pending','sent') AND notification_eligible=1),0) AS new_count,"
                 "COALESCE(SUM(status='sent' AND notification_eligible=1),0) AS accepted_count,"
-                "COALESCE(SUM(status='pending' AND notification_eligible=1),0) AS pending_count,"
+                "COALESCE(SUM(status='pending' AND notification_eligible=1 AND attempts=0 AND send_started_at IS NULL),0) AS pending_count,"
                 "COALESCE(SUM(status='pending' AND notification_eligible=1 AND attempts>0),0) AS failure_count,"
                 "COALESCE(SUM(status='pending' AND notification_eligible=1 AND send_started_at IS NOT NULL AND attempts=0),0) AS uncertain_count "
                 "FROM posts WHERE source_school=58 AND source_category=14 "
@@ -240,9 +240,9 @@ def read_database_snapshot(path: str | Path, *, limit: int = 100) -> DatabaseSna
                 if row["status"] == "sent":
                     bark_status = "Bark 已接受"
                 elif row["send_started_at"] is not None and row["attempts"] == 0:
-                    bark_status = "发送状态待核对"
+                    bark_status = "发送结果待核对，不自动重发"
                 elif row["attempts"] > 0 or row["last_error"]:
-                    bark_status = "Bark 发送失败"
+                    bark_status = "Bark 发送失败，不自动重发"
                 else:
                     bark_status = "待发送"
                 posts.append(RecentPost(
@@ -481,12 +481,12 @@ def _runtime_description(snapshot: DashboardSnapshot) -> str:
         details.append(f"错误类型：{error_type or summary_error}")
     database = snapshot.database
     if database.bark_failure_count:
-        failure = f"Bark 发送失败记录：{database.bark_failure_count} 条"
+        failure = f"Bark 发送失败待核对：{database.bark_failure_count} 条（不自动重发）"
         if database.last_bark_error_type:
             failure += f" · {database.last_bark_error_type}"
         details.append(failure)
     if database.uncertain_count:
-        details.append(f"发送结果待核对：{database.uncertain_count} 条")
+        details.append(f"发送结果待核对：{database.uncertain_count} 条（不自动重发）")
     return " · ".join(details) if details else "状态来自本地运行证据；Bark 接受不代表手机已送达。"
 
 
@@ -783,7 +783,7 @@ class WatchTUI(App[None]):
             f"最近成功扫描：{_epoch_label(stats.last_success_at)} · {stats.last_pages} 页 / {stats.last_posts} 条",
             f"freshKey：{_freshness_label(runtime)}",
             f"帖子统计：历史基线 {stats.baseline_count} · 累计不同 {stats.distinct_count} · 累计新增 {stats.new_count}",
-            f"通知统计：Bark 已接受 {stats.bark_accepted_count} · 当前待发 {stats.pending_count} · 失败 {stats.bark_failure_count} · 状态待核对 {stats.uncertain_count}",
+            f"通知统计：Bark 已接受 {stats.bark_accepted_count} · 当前待发 {stats.pending_count} · 失败待核对 {stats.bark_failure_count} · 结果待核对 {stats.uncertain_count}",
             "说明：Bark 服务端接受不代表手机实际送达。",
         ]
         diagnostic = _runtime_description(snapshot)

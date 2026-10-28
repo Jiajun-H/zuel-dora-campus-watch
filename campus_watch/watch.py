@@ -239,6 +239,10 @@ class WatchMonitor(Monitor):
         if self.stopped():
             result.warnings.append("watch_stop_pending_preserved")
             return
+        if self.store._connection.execute(
+            "SELECT 1 FROM posts WHERE status='pending' AND (attempts>0 OR send_started_at IS NOT NULL) LIMIT 1"
+        ).fetchone():
+            result.warnings.append("attempted_notifications_held_no_auto_retry")
         super()._deliver_pending(result)
 
 
@@ -388,11 +392,6 @@ class WatchRunner:
         except Exception as exc:
             self.record_failure("state_publish_failed", exc)
 
-    def attempted_pending(self):
-        return self.store._connection.execute(
-            "SELECT COUNT(*) FROM posts WHERE status='pending' AND (attempts>0 OR send_started_at IS NOT NULL)"
-        ).fetchone()[0]
-
     @contextmanager
     def signals(self):
         previous = {}
@@ -412,9 +411,6 @@ class WatchRunner:
             with self.store.run_lock(), self.signals():
                 owns_lock = True
                 self.ledger = RequestLedger(self.ledger_path, self.daily_get_limit, self.clock)
-                if self.attempted_pending():
-                    self.write_state("paused", "attempted_pending_requires_review")
-                    return "paused"
                 if self.store.baseline_complete and self.store.visibility_snapshot is None:
                     self.write_state("paused", "visibility_snapshot_requires_rebaseline")
                     return "paused"
@@ -459,12 +455,9 @@ class WatchRunner:
                     baseline_pages=self.baseline_pages, coverage_pages=self.coverage_pages,
                     max_pages_per_poll=self.max_pages, lookback_pages=0,
                     missing_content_policy="require", uncertain_policy="notify-window",
-                    max_alerts=self.max_alerts, clock=self.clock)
+                    max_alerts=self.max_alerts, clock=self.clock, first_attempt_only=True)
                 monitor.freshness_report = self.round_freshness
                 while not self.stopped():
-                    if self.attempted_pending():
-                        self.write_state("paused", "attempted_pending_requires_review")
-                        return "paused"
                     if self.ledger.remaining() < self.max_pages:
                         self.write_state("paused", "insufficient_daily_round_budget")
                         return "paused"
@@ -496,13 +489,18 @@ class WatchRunner:
                     if self.stopped():
                         self.write_state("stopped", "stop_requested")
                         return "stopped"
-                    if result.status not in ("baseline", "ok", "partial") or result.retry_failures:
+                    if result.status not in ("baseline", "ok", "partial") or (
+                        result.retry_failures and not (
+                            result.status == "partial" and "notification_failed_pending_preserved" in result.warnings
+                        )
+                    ):
                         self.write_state("paused", "round_failed_requires_review")
                         return "paused"
                     # A successful gap recovery already records unknown backlog
                     # silently and advances the window. Continue from it rather
                     # than requiring a second manual launch. Incomplete scans
-                    # and uncertain delivery attempts still pause above.
+                    # still pause above. Attempted notifications stay pending
+                    # for review, but never block or repeat automatic delivery.
                     if max_cycles is not None and self.rounds >= max_cycles:
                         self.write_state("stopped", "offline_cycle_limit")
                         return "stopped"

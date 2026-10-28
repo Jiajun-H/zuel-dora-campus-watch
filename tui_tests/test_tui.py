@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -118,6 +119,18 @@ class TuiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_runtime_state({"runtime_state": "failed_exit"}, None)[0], "异常退出")
         self.assertEqual(_runtime_state({}, "LocalReadError")[0], "状态读取异常")
         self.assertEqual(_runtime_state({"runtime_state": []}, None)[0], "未启动")
+
+    def test_attempted_notifications_remain_visible_but_are_not_counted_as_waiting_to_send(self):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE posts SET attempts=1, last_error='PushDeliveryError', send_started_at=1792699510 WHERE post_id=3")
+            connection.execute("INSERT INTO posts VALUES (6,1792699700,'pending',58,0,0,NULL,NULL,1,14,'response_field','结果不明', 'preview','synthetic-evidence','utf8','preview',1792699710)")
+        snapshot = read_database_snapshot(self.db)
+        self.assertEqual(snapshot.pending_count, 0)
+        self.assertEqual(snapshot.bark_failure_count, 1)
+        self.assertEqual(snapshot.uncertain_count, 1)
+        labels = {post.post_id: post.bark_status for post in snapshot.recent_posts}
+        self.assertIn('不自动重发', labels[3])
+        self.assertIn('不自动重发', labels[6])
 
     async def test_closing_tui_while_scanning_never_calls_stop(self):
         controller = FakeController({

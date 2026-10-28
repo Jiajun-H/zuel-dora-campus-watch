@@ -770,8 +770,13 @@ class SQLiteStore:
 
     def pending_posts(self, limit: int = 30, *, confirmed_only: bool = False,
                       require_summary: bool = False, body_policy: str = "metadata",
-                      now: int | None = None, visibility_policy: str | None = None) -> list[ForumPost]:
+                      now: int | None = None, visibility_policy: str | None = None,
+                      first_attempt_only: bool = False) -> list[ForumPost]:
         filters = " AND notification_eligible=1" if confirmed_only else ""
+        if first_attempt_only:
+            filters += " AND attempts=0"
+            if self.discovery_policy == "visibility":
+                filters += " AND send_started_at IS NULL"
         if visibility_policy not in (None, "hold", "notify-window"):
             raise StoreError("unsupported visibility notification policy")
         if self.discovery_policy == "visibility" and visibility_policy == "hold":
